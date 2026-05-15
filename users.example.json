@@ -1,0 +1,18 @@
+{
+  "users": [
+    {
+      "slug": "operator",
+      "name": "Operator (You)",
+      "whatsapp": ["15551234567"],
+      "slack": ["U01ABC123"],
+      "profiles": ["*"]
+    },
+    {
+      "slug": "teammate",
+      "name": "Teammate",
+      "whatsapp": ["15559876543"],
+      "slack": [],
+      "profiles": ["notes", "echo"]
+    }
+  ]
+}

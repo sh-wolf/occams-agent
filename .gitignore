@@ -1,0 +1,20 @@
+# per-clone runtime state
+node_modules/
+.env
+auth/
+state.json
+
+# top-level shared identity file (contains phone numbers / Slack IDs)
+users.json
+
+# top-level authority config (per-deploy; permissions.example.json is the template)
+permissions.json
+
+# cron-fired output dumps (noisy, per-run)
+vault/users/*/jobs-output/
+
+# macos
+.DS_Store
+
+# obsidian per-machine workspace state and scratch files
+vault/.obsidian/

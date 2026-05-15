@@ -1,0 +1,23 @@
+[Unit]
+Description=occams-agent (WhatsApp/Slack <-> Claude/Codex bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@APP_DIR@
+ExecStart=/usr/bin/node occams-agent-runtime/src/index.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+# Include the user's ~/.local/bin so the bridge can find the `claude` CLI
+# (installed via the claude.ai installer to that location). systemd otherwise
+# strips PATH down to a minimal default.
+Environment="PATH=/home/@USER@/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# WorkingDirectory is the orchestration repo root; .env, users.json, and
+# vault/ all sit there. config.js loads .env from the repo root explicitly.
+
+[Install]
+WantedBy=multi-user.target
