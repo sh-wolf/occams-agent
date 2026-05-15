@@ -20,7 +20,15 @@
       "env": {
         "_comment": "Map agent-facing env names to keys present in .env. The agent sees only what's listed here. Example: an Anthropic API key for tool use that should bill notes' allotment, not admin's.",
         "OPENAI_API_KEY": "NOTES_OPENAI_API_KEY"
-      }
+      },
+      "extra_repos": [
+        {
+          "_comment": "External git repos this profile can read/edit. mode:\"pr\" uses git worktree + branch + /submit → PR (recommended). mode:\"direct\" bind-mounts the live checkout. Use `env` for paths that vary per deployment (the var lives in .env); use `path` for literals that are stable across deployments.",
+          "env": "NOTES_RESEARCH_REPO",
+          "mode": "pr",
+          "branch_prefix": "agent/notes"
+        }
+      ]
     },
 
     "echo": {

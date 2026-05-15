@@ -8,6 +8,7 @@ import os from 'node:os'
 import { config } from './config.js'
 import { ensureClaudeSession, getSession, setSession } from './state.js'
 import { ensureAreaDirs } from './users.js'
+import { resolveExtraRepos } from './worktrees.js'
 
 const SUPPORTED = new Set(['claude', 'codex'])
 const DEFAULT_TIMEOUT_MS = 20 * 60_000
@@ -170,7 +171,7 @@ async function profileDirsForAddDir(profile) {
   return [config.repoRoot]
 }
 
-function bridgeContext({ user, profile, areas }) {
+function bridgeContext({ user, profile, areas, extraRepos = [] }) {
   const areaList = areas.length ? areas.join(', ') : '(none)'
   const lines = [
     `[bridge context]`,
@@ -185,6 +186,16 @@ function bridgeContext({ user, profile, areas }) {
   }
   if (profile.sandbox === 'strict' && BWRAP_PATH) {
     lines.push(`You are running inside a bubblewrap sandbox: paths outside the dirs listed above do not exist in your filesystem view. Don't waste turns trying to reach them.`)
+  }
+  if (extraRepos.length > 0) {
+    lines.push(``, `External repos available (read-write):`)
+    for (const r of extraRepos) {
+      if (r.mode === 'pr') {
+        lines.push(`  - ${r.repoName} at ${r.bindPath} — git worktree on branch \`${r.branch}\`. Commit your changes here as you go; the human runs \`/submit\` to push the branch and open a PR. You cannot push directly.`)
+      } else {
+        lines.push(`  - ${r.repoName} at ${r.bindPath} — DIRECT mode: edits land in the live checkout immediately. No PR flow.`)
+      }
+    }
   }
   lines.push(``, `[role]`, profile.role)
   return lines.join('\n')
@@ -291,7 +302,8 @@ function bwrapPrefixArgs(allowedRwDirs) {
 
   // HOME: tmpfs with selected dotdirs bound in so the agent CLI's own state
   // (OAuth, npm cache, installed binary) is reachable. RW so the CLI can keep
-  // writing its session/cache files.
+  // writing its session/cache files. ~/.gitconfig is bound read-only so that
+  // `git commit` works inside the sandbox (it needs user.name + user.email).
   const home = process.env.HOME
   if (home) {
     args.push('--tmpfs', home)
@@ -299,6 +311,8 @@ function bwrapPrefixArgs(allowedRwDirs) {
       const p = path.join(home, sub)
       if (existsSync(p)) args.push('--bind', p, p)
     }
+    const gitconfig = path.join(home, '.gitconfig')
+    if (existsSync(gitconfig)) args.push('--ro-bind', gitconfig, gitconfig)
   }
 
   for (const dir of allowedRwDirs) {
@@ -425,6 +439,8 @@ async function runClaude({ profile, user, chatId, message, timeoutMs, onEvent })
   const cwd = await ensureProfileScratch(profile.slug)
   const { areas, dirs: areaDirs } = await resolveAreaDirs(profile.areas)
   const profileDirs = await profileDirsForAddDir(profile)
+  const extraRepos = await resolveExtraRepos({ profile, chatId })
+  const repoBindDirs = extraRepos.map((r) => r.bindPath)
   const { id: sessionId, isNew } = await ensureClaudeSession(chatId, profile.slug)
 
   // First call creates the session with --session-id. Subsequent calls resume
@@ -440,9 +456,9 @@ async function runClaude({ profile, user, chatId, message, timeoutMs, onEvent })
     '--verbose',
     ...sessionArgs,
     '--permission-mode', config.claude.permissionMode,
-    '--append-system-prompt', bridgeContext({ user, profile, areas }),
+    '--append-system-prompt', bridgeContext({ user, profile, areas, extraRepos }),
   ]
-  const addDirs = [...profileDirs, ...areaDirs, cwd]
+  const addDirs = [...profileDirs, ...areaDirs, ...repoBindDirs, cwd]
   if (addDirs.length > 0) {
     args.push('--add-dir', ...addDirs)
   }
@@ -549,6 +565,8 @@ async function runCodex({ profile, user, chatId, message, timeoutMs, onEvent }) 
   const cwd = await ensureProfileScratch(profile.slug)
   const { areas, dirs: areaDirs } = await resolveAreaDirs(profile.areas)
   const profileDirs = await profileDirsForAddDir(profile)
+  const extraRepos = await resolveExtraRepos({ profile, chatId })
+  const repoBindDirs = extraRepos.map((r) => r.bindPath)
   const replyFile = path.join(os.tmpdir(), `codex-reply-${randomUUID()}.txt`)
   const existing = await getSession(chatId, profile.slug, 'codex')
 
@@ -560,7 +578,7 @@ async function runCodex({ profile, user, chatId, message, timeoutMs, onEvent }) 
   if (config.codex.bypassApprovals) {
     baseArgs.push('-c', 'approval_policy="never"')
   }
-  for (const dir of [...profileDirs, ...areaDirs]) {
+  for (const dir of [...profileDirs, ...areaDirs, ...repoBindDirs]) {
     baseArgs.push('--add-dir', dir)
   }
 
@@ -577,10 +595,10 @@ async function runCodex({ profile, user, chatId, message, timeoutMs, onEvent }) 
 
   const stdinPayload = existing
     ? message
-    : `${bridgeContext({ user, profile, areas })}\n\n${message}`
+    : `${bridgeContext({ user, profile, areas, extraRepos })}\n\n${message}`
 
   const env = buildSubprocessEnv(profile)
-  const rwDirs = [...profileDirs, ...areaDirs, cwd, path.dirname(replyFile)]
+  const rwDirs = [...profileDirs, ...areaDirs, ...repoBindDirs, cwd, path.dirname(replyFile)]
   const { cmd, args: wrappedArgs } = wrapForSandbox(profile, rwDirs, 'codex', args)
 
   try {

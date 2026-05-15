@@ -13,6 +13,9 @@ permissions.json
 # cron-fired output dumps (noisy, per-run)
 vault/users/*/jobs-output/
 
+# external-repo worktrees — created per (chatId, repo) for the PR-mode workflow
+vault/users/*/worktrees/
+
 # macos
 .DS_Store
 

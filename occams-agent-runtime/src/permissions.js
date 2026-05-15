@@ -14,7 +14,9 @@ import { config } from './config.js'
 
 const SANDBOXES = new Set(['full', 'strict'])
 const BILLINGS = new Set(['subscription', 'api'])
+const REPO_MODES = new Set(['pr', 'direct'])
 const SLUG_RE = /^[a-z0-9_-]+$/
+const ENV_RE = /^[A-Z][A-Z0-9_]*$/
 
 let cache = null
 let cachedPath = null
@@ -76,7 +78,43 @@ function validateProfile(slug, entry) {
   if (entry.superuser && sandbox !== 'full') {
     throw new Error(`permissions.json: profile "${slug}" is superuser; sandbox must be "full"`)
   }
-  return { areas: entry.areas, superuser: entry.superuser, sandbox, billing, env }
+
+  const extra_repos = validateExtraRepos(slug, entry.extra_repos ?? [])
+
+  return { areas: entry.areas, superuser: entry.superuser, sandbox, billing, env, extra_repos }
+}
+
+function validateExtraRepos(slug, repos) {
+  if (!Array.isArray(repos)) {
+    throw new Error(`permissions.json: profile "${slug}".extra_repos must be an array`)
+  }
+  const out = []
+  for (const [i, entry] of repos.entries()) {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`permissions.json: profile "${slug}".extra_repos[${i}] must be an object`)
+    }
+    const hasPath = typeof entry.path === 'string' && entry.path.length > 0
+    const hasEnv = typeof entry.env === 'string' && entry.env.length > 0
+    if (hasPath === hasEnv) {
+      throw new Error(`permissions.json: profile "${slug}".extra_repos[${i}] must declare exactly one of "path" or "env"`)
+    }
+    if (hasEnv && !ENV_RE.test(entry.env)) {
+      throw new Error(`permissions.json: profile "${slug}".extra_repos[${i}].env "${entry.env}" must be UPPER_SNAKE_CASE`)
+    }
+    if (!entry.mode || !REPO_MODES.has(entry.mode)) {
+      throw new Error(`permissions.json: profile "${slug}".extra_repos[${i}].mode must be one of: ${[...REPO_MODES].join(', ')}`)
+    }
+    if (entry.branch_prefix != null && typeof entry.branch_prefix !== 'string') {
+      throw new Error(`permissions.json: profile "${slug}".extra_repos[${i}].branch_prefix must be a string`)
+    }
+    out.push({
+      path: hasPath ? entry.path : undefined,
+      env: hasEnv ? entry.env : undefined,
+      mode: entry.mode,
+      branch_prefix: entry.branch_prefix ?? undefined,
+    })
+  }
+  return out
 }
 
 async function loadFrom(filePath) {

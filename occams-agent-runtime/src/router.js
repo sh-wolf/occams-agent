@@ -18,10 +18,16 @@ import {
   validateCron,
   isoToCron,
 } from './jobs.js'
+import {
+  listChatWorktrees,
+  submitWorktree,
+  removeChatWorktrees,
+} from './worktrees.js'
+import path from 'node:path'
 
 const RUNTIME_PREFIXES = new Set([
   'help', 'whoami', 'profiles', 'reset', 'new', 'forget',
-  'jobs', 'cron', 'claude', 'codex', 'streaming', 'stop',
+  'jobs', 'cron', 'claude', 'codex', 'streaming', 'stop', 'submit',
 ])
 
 function parseMessage(text, profileSlugs) {
@@ -57,6 +63,9 @@ function parseMessage(text, profileSlugs) {
   // /stop must dispatch OUTSIDE runAgent — see handleMessage. Don't move this
   // into the agent path or it'll queue behind the very process it's killing.
   if (/^\/stop\b/i.test(trimmed)) return { kind: 'stop' }
+  if (/^\/submit\b/i.test(trimmed)) {
+    return { kind: 'submit', title: trimmed.replace(/^\/submit\s*/i, '').trim() || null, profileOverride }
+  }
 
   let cliAgent = null
   if (/^\/claude\b/i.test(trimmed)) {
@@ -113,6 +122,7 @@ const HELP_TEXT = [
   '  /codex <msg>           — one-shot: use Codex regardless of default',
   '  /streaming [on|off]    — show or hide the live tool-call trace in this chat',
   '  /stop                  — stop the agent turn that\'s running for this chat. Doesn\'t drain queued messages.',
+  '  /submit [title]        — push the agent\'s external-repo worktree(s) for this chat as a pull request',
   '  /help                  — this message',
   '',
   'Plain messages route to the chat\'s bound profile. Switch with /<other-slug>.',
@@ -229,6 +239,23 @@ async function handleCronCommand({ profile, user, channel, rest }) {
   return `Scheduled ${id} under /${profile.slug}: \`${spec.schedule}\`${spec.runOnce ? ' (once)' : ''} ${spec.timezone} → ${spec.deliver_to}`
 }
 
+async function handleSubmitCommand({ profile, chatId, title }) {
+  const worktrees = await listChatWorktrees({ profileSlug: profile.slug, chatId })
+  if (worktrees.length === 0) {
+    return 'No external-repo worktrees for this chat. Nothing to submit.'
+  }
+  const lines = []
+  for (const wt of worktrees) {
+    try {
+      const r = await submitWorktree({ worktreePath: wt, title, slug: profile.slug, chatId })
+      lines.push(`✅ ${r.repoName}: ${r.url}`)
+    } catch (err) {
+      lines.push(`❌ ${path.basename(wt)}: ${err.message}`)
+    }
+  }
+  return lines.join('\n')
+}
+
 export async function handleMessage({ text, chatId, channel, user, onEvent }) {
   const profiles = await listProfiles()
   const profileSlugs = new Set(profiles.map((p) => p.slug))
@@ -241,6 +268,17 @@ export async function handleMessage({ text, chatId, channel, user, onEvent }) {
     return formatProfiles(profiles, bound)
   }
   if (parsed.kind === 'forget') {
+    // Clean up any external-repo worktrees that belonged to this chat before
+    // we throw away the binding. We need the bound profile to know whose
+    // worktrees dir to scan — done before clearChat() destroys that mapping.
+    const boundSlug = await getProfileBinding(chatId)
+    if (boundSlug) {
+      try {
+        await removeChatWorktrees({ profileSlug: boundSlug, chatId })
+      } catch (err) {
+        console.error(`[forget] worktree cleanup failed: ${err.message}`)
+      }
+    }
     const had = await clearChat(chatId)
     return had ? 'Wiped this chat — profile and history.' : 'Nothing to forget.'
   }
@@ -270,6 +308,7 @@ export async function handleMessage({ text, chatId, channel, user, onEvent }) {
   }
   if (parsed.kind === 'jobs') return handleJobsCommand({ profile, rest: parsed.rest })
   if (parsed.kind === 'cron') return handleCronCommand({ profile, user, channel, rest: parsed.rest })
+  if (parsed.kind === 'submit') return handleSubmitCommand({ profile, chatId, title: parsed.title })
 
   if (!parsed.message) {
     return `This chat is bound to /${profile.slug}. Send a message to start.`
