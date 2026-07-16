@@ -87,6 +87,13 @@ function run(cmd, args, opts = {}) {
   })
 }
 
+// git may echo a remote URL (which carries an inline push credential for the
+// extra_repo) into stderr on a failed push. Scrub userinfo before any such
+// message can propagate to chat via handleSubmitCommand's catch.
+function redactUrl(s) {
+  return String(s).replace(/(https?:\/\/)[^@\s/]+@/g, '$1***@')
+}
+
 async function defaultBranchOf(sourcePath) {
   // Try origin/HEAD first; fall back to common names.
   try {
@@ -124,14 +131,29 @@ export async function ensureWorktree({ profileSlug, chatId, sourcePath, branchPr
   }
 
   const defaultBranch = await defaultBranchOf(sourcePath)
-  const baseRef = `origin/${defaultBranch}`
+  const { stdout: baseSha } = await run('git', ['-C', sourcePath, 'rev-parse', `origin/${defaultBranch}`])
 
-  // -B creates the branch fresh from baseRef. If a stale branch by this
-  // name exists (e.g. from a previous chat with the same hash, vanishingly
-  // unlikely), it gets reset — that's intentional, the worktree dir didn't
-  // exist so there was no in-progress work to preserve.
-  await run('git', ['-C', sourcePath, 'worktree', 'add', '-B', branch, wt, baseRef])
-  console.log(`[worktrees] created ${path.basename(wt)} on branch ${branch} from ${baseRef}`)
+  // We deliberately do NOT use `git worktree add`: a linked worktree's .git is
+  // a pointer file into <source>/.git/worktrees/<n>, and <source>/.git carries
+  // an inline push credential in its remote URL. Binding that into the agent's
+  // strict sandbox would leak the token (read-only bind) or allow hook-injection
+  // code-exec as the unsandboxed host user (read-write bind). Instead make a
+  // self-contained local clone: a real .git dir fully inside the sandbox-bound
+  // worktree, a full independent object copy (--no-hardlinks: hardlinks fail
+  // cross-device, and we don't want fragility if worktrees/ and the source
+  // ever land on different mounts), and NO remote at all — so there is no
+  // token anywhere in the agent's view and no path back to the host repo. The
+  // bridge supplies the authenticated push target host-side at /submit time
+  // (see submitWorktree).
+  await run('git', ['clone', '--local', '--no-hardlinks', '--no-checkout', sourcePath, wt])
+  await run('git', ['-C', wt, 'checkout', '-B', branch, baseSha])
+  // Breadcrumb so submitWorktree can find the credentialed source host-side.
+  await run('git', ['-C', wt, 'config', 'agent.sourcepath', sourcePath])
+  // Drop the local-path origin the clone created. The agent never pushes and
+  // can't reach that path from the sandbox anyway; a dangling remote just
+  // invites confusing `git fetch` errors inside the worktree.
+  await run('git', ['-C', wt, 'remote', 'remove', 'origin'])
+  console.log(`[worktrees] cloned ${path.basename(wt)} on branch ${branch} from ${sourcePath} @ ${baseSha.slice(0, 8)} (base ${defaultBranch})`)
   return { path: wt, branch, created: true }
 }
 
@@ -203,16 +225,46 @@ export async function submitWorktree({ worktreePath, title, slug, chatId }) {
   const { stdout: branch } = await run('git', ['-C', worktreePath, 'branch', '--show-current'])
   if (!branch) throw new Error(`worktree ${worktreePath} is not on a branch`)
 
-  const defaultBranch = await defaultBranchOf(worktreePath)
-  const { stdout: ahead } = await run('git', ['-C', worktreePath, 'rev-list', '--count', `origin/${defaultBranch}..HEAD`])
-  if (parseInt(ahead, 10) === 0) {
-    throw new Error(`branch ${branch} has no commits beyond origin/${defaultBranch} — nothing to submit`)
+  // The worktree is a self-contained local clone with NO remote (see
+  // ensureWorktree). The credentialed source repo — the only place the push
+  // token lives — was recorded host-side at clone time. This whole function
+  // runs in the bridge process, unsandboxed; the token never crosses into the
+  // agent or chat.
+  let sourcePath
+  try {
+    const { stdout } = await run('git', ['-C', worktreePath, 'config', '--get', 'agent.sourcepath'])
+    sourcePath = stdout
+  } catch {
+    throw new Error(`worktree ${worktreePath} has no agent.sourcepath — not a clone-mode worktree?`)
+  }
+  if (!sourcePath || !existsSync(sourcePath)) {
+    throw new Error(`recorded source for ${path.basename(worktreePath)} is missing`)
   }
 
-  // 3. Push
-  await run('git', ['-C', worktreePath, 'push', '-u', 'origin', branch])
+  const defaultBranch = await defaultBranchOf(sourcePath)
+  const { stdout: baseSha } = await run('git', ['-C', sourcePath, 'rev-parse', `origin/${defaultBranch}`])
+  const { stdout: ahead } = await run('git', ['-C', worktreePath, 'rev-list', '--count', `${baseSha}..HEAD`])
+  if (parseInt(ahead, 10) === 0) {
+    throw new Error(`branch ${branch} has no commits beyond ${defaultBranch} — nothing to submit`)
+  }
 
-  // 4. Open PR
+  // 3. Push. The authenticated URL lives only in the source repo's config; we
+  // push the branch there explicitly rather than adding a remote to the
+  // worktree. Scrub credentials from any failure message before it can reach
+  // chat.
+  const { stdout: pushUrl } = await run('git', ['-C', sourcePath, 'config', '--get', 'remote.origin.url'])
+  if (!pushUrl) throw new Error(`source has no remote.origin.url to push to`)
+  try {
+    await run('git', ['-C', worktreePath, 'push', pushUrl, `HEAD:refs/heads/${branch}`])
+  } catch (err) {
+    throw new Error(redactUrl(err.message))
+  }
+
+  // 4. Open PR. Derive owner/repo from the URL (minus any inline credential)
+  // so `gh` gets an explicit target and needs no remote in the worktree.
+  const m = pushUrl.match(/github\.com[/:]([^/]+\/[^/\s]+?)(?:\.git)?\/?$/)
+  if (!m) throw new Error(`could not parse owner/repo from remote url`)
+  const ownerRepo = m[1]
   const repoName = path.basename(worktreePath).replace(/^[0-9a-f]{8}-/, '')
   const prTitle = title || `agent /${slug}: ${branch}`
   const body = [
@@ -223,11 +275,12 @@ export async function submitWorktree({ worktreePath, title, slug, chatId }) {
   ].join('\n')
 
   const { stdout: prUrl } = await run('gh', ['pr', 'create',
+    '--repo', ownerRepo,
     '--title', prTitle,
     '--body', body,
     '--base', defaultBranch,
     '--head', branch,
-  ], { cwd: worktreePath })
+  ])
 
   return { url: prUrl, branch, repoName }
 }

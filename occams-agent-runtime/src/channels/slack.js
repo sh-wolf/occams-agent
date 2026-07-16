@@ -4,6 +4,8 @@ import { handleMessage } from '../router.js'
 import { findUserBySlack } from '../users.js'
 import { transcribeAudio } from '../transcribe.js'
 import { getChatStreaming } from '../state.js'
+import { createStreamDriver } from './stream-driver.js'
+import { toSlackMrkdwn } from './slack-format.js'
 
 const { App } = bolt
 
@@ -32,48 +34,6 @@ async function downloadSlackFile(fileObj, botToken) {
 
 // Slack chat.update is limited to ~1/sec per channel. Throttle live edits.
 const RENDER_INTERVAL_MS = 700
-// Slack message text caps at 40k chars. Trim aggressively to leave room.
-const MAX_TRANSCRIPT_CHARS = 3500
-
-function truncate(s, n) {
-  if (!s) return ''
-  const oneLine = String(s).replace(/\s+/g, ' ').trim()
-  return oneLine.length > n ? oneLine.slice(0, n - 1) + '…' : oneLine
-}
-
-// Render a normalized agent event (from agent.js) as a single transcript line.
-// Returns null for event types we don't display.
-function renderEvent(evt) {
-  if (evt.type === 'thinking' && evt.text) {
-    return `💭 _${truncate(evt.text, 120)}_`
-  }
-  if (evt.type === 'tool_use') {
-    const summary = evt.summary ? ` ${truncate(evt.summary, 100)}` : ''
-    return `🔧 \`${evt.name}\`${summary}`
-  }
-  return null
-}
-
-function buildTranscript(lines) {
-  if (lines.length === 0) return ''
-  let out = lines.join('\n')
-  if (out.length > MAX_TRANSCRIPT_CHARS) {
-    out = '…\n' + out.slice(out.length - MAX_TRANSCRIPT_CHARS)
-  }
-  return out
-}
-
-function buildWorkingText(transcript) {
-  const head = '🤔 _working…_'
-  return transcript ? `${head}\n${transcript}` : head
-}
-
-function buildFinalText(transcript, reply) {
-  const body = reply || '(no output)'
-  if (!transcript) return body
-  // Put the answer up top, trace below in a quoted block so it stays scannable.
-  return `${body}\n\n>\n> ${transcript.split('\n').join('\n> ')}`
-}
 
 export async function startSlack() {
   if (!config.slack.botToken || !config.slack.appToken) {
@@ -134,116 +94,55 @@ export async function startSlack() {
       text = text ? `${text}\n\n${joined}` : joined
     }
 
+    // Image uploads: download and pass through as attachments. The agent
+    // layer writes them into the profile scratch and points the Read tool
+    // at them (it renders images natively).
+    const attachments = []
+    const imageFiles = (event.files ?? []).filter((f) => (f.mimetype ?? '').startsWith('image/'))
+    for (const f of imageFiles) {
+      try {
+        const buf = await downloadSlackFile(f, config.slack.botToken)
+        console.log(`[slack] received image ${f.name} (${f.mimetype}, ${buf.length} bytes)`)
+        attachments.push({ buffer: buf, mimetype: f.mimetype, name: f.name })
+      } catch (err) {
+        console.error(`[slack] image download failed for ${f.name}:`, err.message)
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: threadTs,
+          text: `⚠️ Couldn't fetch image ${f.name}: ${err.message}`,
+        }).catch(() => {})
+        return
+      }
+    }
+    if (!text && attachments.length > 0) text = '(image)'
+
     if (!text) return
 
     const chatId = `slack:${event.channel}:${threadTs}`
     const streaming = await getChatStreaming(chatId)
 
-    // Streaming off: skip placeholder + live edits, just post the final reply
-    // as a thread message when the agent finishes.
-    if (!streaming) {
-      let reply
-      let errorMessage = null
-      try {
-        reply = await handleMessage({ text, chatId, channel: 'slack', user })
-      } catch (err) {
-        // The /stop command already sent its own "Stopped." reply, so just
-        // drop the original turn silently rather than posting an exit warning.
-        if (err.name === 'StoppedError') return
-        console.error('[slack] handler error:', err)
-        errorMessage = err.message
-      }
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: errorMessage ? `⚠️ ${errorMessage}` : (reply || '(no output)'),
-      }).catch((err) => console.error('[slack] reply post failed:', err.message))
-      return
-    }
+    const driver = createStreamDriver({
+      streaming,
+      renderIntervalMs: RENDER_INTERVAL_MS,
+      post: (t) =>
+        client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: toSlackMrkdwn(t) }),
+      sendEditable: (t) =>
+        client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: toSlackMrkdwn(t) }),
+      edit: (handle, t) =>
+        client.chat.update({ channel: event.channel, ts: handle.ts, text: toSlackMrkdwn(t) }),
+      logTag: 'slack',
+    })
 
-    let placeholder
-    try {
-      placeholder = await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: '🤔 _working…_',
-      })
-    } catch (err) {
-      console.error('[slack] could not post placeholder:', err.message)
-      return
-    }
-
-    const transcriptLines = []
-    let pendingTimer = null
-    let inFlight = false
-    let lastRenderAt = 0
-    let needsRender = false
-
-    async function doRender(textToSend) {
-      inFlight = true
-      try {
-        await client.chat.update({
-          channel: event.channel,
-          ts: placeholder.ts,
-          text: textToSend,
-        })
-        lastRenderAt = Date.now()
-      } catch (err) {
-        console.error('[slack] chat.update failed:', err.data?.error ?? err.message)
-      } finally {
-        inFlight = false
-      }
-    }
-
-    function scheduleLiveRender() {
-      needsRender = true
-      if (pendingTimer || inFlight) return
-      const wait = Math.max(0, RENDER_INTERVAL_MS - (Date.now() - lastRenderAt))
-      pendingTimer = setTimeout(async () => {
-        pendingTimer = null
-        if (!needsRender) return
-        needsRender = false
-        await doRender(buildWorkingText(buildTranscript(transcriptLines)))
-        if (needsRender) scheduleLiveRender()
-      }, wait)
-    }
-
-    function onEvent(evt) {
-      const line = renderEvent(evt)
-      if (!line) return
-      transcriptLines.push(line)
-      scheduleLiveRender()
-    }
-
-    let reply
-    let errorMessage = null
+    let reply = ''
     let stopped = false
+    let errorMessage = null
     try {
-      reply = await handleMessage({ text, chatId, channel: 'slack', user, onEvent })
+      reply = await handleMessage({ text, chatId, channel: 'slack', user, attachments, onEvent: driver.onEvent })
     } catch (err) {
-      if (err.name === 'StoppedError') {
-        stopped = true
-      } else {
-        console.error('[slack] handler error:', err)
-        errorMessage = err.message
-      }
+      if (err.name === 'StoppedError') stopped = true
+      else { console.error('[slack] handler error:', err); errorMessage = err.message }
     }
-
-    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
-    // Wait briefly for any in-flight update to settle before the final edit.
-    if (inFlight) await new Promise((r) => setTimeout(r, 100))
-
-    const transcript = buildTranscript(transcriptLines)
-    let finalText
-    if (stopped) {
-      finalText = transcript ? `_(stopped)_\n\n>\n> ${transcript.split('\n').join('\n> ')}` : '_(stopped)_'
-    } else if (errorMessage) {
-      finalText = `⚠️ ${errorMessage}${transcript ? `\n\n>\n> ${transcript.split('\n').join('\n> ')}` : ''}`
-    } else {
-      finalText = buildFinalText(transcript, reply)
-    }
-
-    await doRender(finalText)
+    await driver.finalize({ stopped, errorMessage, reply })
   }
 
   app.event('app_mention', respond)
@@ -257,7 +156,7 @@ export async function startSlack() {
 
   async function sendDM(userId, text) {
     // Slack accepts a user ID as channel in chat.postMessage; it opens the IM.
-    await app.client.chat.postMessage({ channel: userId, text })
+    await app.client.chat.postMessage({ channel: userId, text: toSlackMrkdwn(text) })
   }
   return { app, sendDM }
 }

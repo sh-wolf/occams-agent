@@ -59,6 +59,9 @@ async function buildProfile(slug, dir, perms) {
     billing: perms.billing,
     env: perms.env,
     extra_repos: perms.extra_repos ?? [],
+    model: perms.model ?? null,
+    effort: perms.effort ?? null,
+    deny_tools: perms.deny_tools ?? [],
   }
 }
 

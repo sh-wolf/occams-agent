@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { config } from './config.js'
+import { getProfilePermissions } from './permissions.js'
 
 let cache = null
 let writing = Promise.resolve()
@@ -30,6 +31,20 @@ function chatEntry(state, chatId) {
 export async function getProfileBinding(chatId) {
   const state = await load()
   return state.chats[chatId]?.profile ?? null
+}
+
+export async function listChatState() {
+  const state = await load()
+  return Object.entries(state.chats).map(([chatId, entry]) => {
+    const sessions = entry?.sessions && typeof entry.sessions === 'object' ? entry.sessions : {}
+    const profileSlugs = Object.keys(sessions)
+    return {
+      chatId,
+      profile: entry?.profile ?? profileSlugs[0] ?? null,
+      streaming: entry?.streaming !== false,
+      sessions,
+    }
+  })
 }
 
 export async function setProfileBinding(chatId, profileSlug) {
@@ -79,7 +94,16 @@ export async function clearChatSessions(chatId) {
 // and only show the final answer. Defaults to on for new chats.
 export async function getChatStreaming(chatId) {
   const state = await load()
-  return state.chats[chatId]?.streaming !== false
+  const entry = state.chats[chatId]
+  // An explicit /streaming choice for this chat always wins.
+  if (entry && typeof entry.streaming === 'boolean') return entry.streaming
+  // Otherwise fall back to the bound profile's default, then the global default.
+  const slug = entry?.profile ?? null
+  if (slug) {
+    const perms = await getProfilePermissions(slug).catch(() => null)
+    if (perms && typeof perms.streaming === 'boolean') return perms.streaming
+  }
+  return true
 }
 
 export async function setChatStreaming(chatId, on) {

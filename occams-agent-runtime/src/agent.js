@@ -1,14 +1,21 @@
 import { spawn } from 'node:child_process'
 import readline from 'node:readline'
-import { readFile, unlink, mkdir } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { readFile, writeFile, unlink, mkdir, readdir, stat } from 'node:fs/promises'
+import { existsSync, lstatSync, realpathSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import os from 'node:os'
 import { config } from './config.js'
 import { ensureClaudeSession, getSession, setSession } from './state.js'
 import { ensureAreaDirs } from './users.js'
+import { listProfiles } from './profiles.js'
 import { resolveExtraRepos } from './worktrees.js'
+import {
+  recordRunEvent,
+  recordRunFinished,
+  recordRunQueued,
+  recordRunStarted,
+} from './registry.js'
 
 const SUPPORTED = new Set(['claude', 'codex'])
 const DEFAULT_TIMEOUT_MS = 20 * 60_000
@@ -28,20 +35,6 @@ export class StoppedError extends Error {
 // chat-locked runAgent and kill the leader of its process group.
 const runningProcs = new Map()
 
-function killProcessTree(proc, signal) {
-  try { process.kill(-proc.pid, signal); return } catch {}
-  try { proc.kill(signal) } catch {}
-}
-
-function terminateProcessTree(proc) {
-  killProcessTree(proc, 'SIGTERM')
-  setTimeout(() => {
-    if (proc.exitCode === null && proc.signalCode === null) {
-      killProcessTree(proc, 'SIGKILL')
-    }
-  }, STOP_GRACE_MS).unref()
-}
-
 function trackProc(chatId, proc) {
   runningProcs.set(chatId, proc)
   const clear = () => {
@@ -58,8 +51,19 @@ export function stopChat(chatId) {
   console.log(`[agent] stopped chatId=${chatId} pid=${proc.pid}`)
   // Kill the whole process group so MCP servers, Bash tool spawns, and any
   // other descendants die too — not just the CLI leader.
-  terminateProcessTree(proc)
+  try { process.kill(-proc.pid, 'SIGTERM') } catch { try { proc.kill('SIGTERM') } catch {} }
+  setTimeout(() => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      try { process.kill(-proc.pid, 'SIGKILL') } catch { try { proc.kill('SIGKILL') } catch {} }
+    }
+  }, STOP_GRACE_MS).unref()
   return true
+}
+
+export function listRunningChatIds() {
+  return [...runningProcs.entries()]
+    .filter(([, proc]) => !proc.killed && proc.exitCode === null && proc.signalCode === null)
+    .map(([chatId]) => chatId)
 }
 
 // ----- Normalized event shapes emitted to onEvent -----
@@ -89,9 +93,15 @@ function summarizeClaudeToolUse(block) {
 
 function normalizeClaudeEvent(evt) {
   if (evt.type !== 'assistant' || !Array.isArray(evt.message?.content)) return []
+  const content = evt.message.content
+  // Emit every assistant text block as `agent_text`. The *final* answer is
+  // also a text block, but streamClaude buffers agent_text and drops the last
+  // one (the answer is delivered separately as finalText) so it isn't echoed.
   const out = []
-  for (const block of evt.message.content) {
-    if (block.type === 'thinking' && block.thinking) {
+  for (const block of content) {
+    if (block.type === 'text' && block.text) {
+      out.push({ type: 'agent_text', text: block.text })
+    } else if (block.type === 'thinking' && block.thinking) {
       out.push({ type: 'thinking', text: block.thinking })
     } else if (block.type === 'tool_use') {
       out.push({ type: 'tool_use', name: block.name, summary: summarizeClaudeToolUse(block) })
@@ -143,24 +153,73 @@ async function ensureProfileScratch(slug) {
   return dir
 }
 
+const MEDIA_DIRNAME = 'inbox-media'
+const MEDIA_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000 // prune inbound media after a week
+
+function extFor({ mimetype, name }) {
+  const fromName = name && path.extname(name).replace('.', '').toLowerCase()
+  if (fromName) return fromName
+  const sub = (mimetype || '').split('/')[1] || 'bin'
+  return sub === 'jpeg' ? 'jpg' : sub.replace(/[^a-z0-9]/gi, '') || 'bin'
+}
+
+// Write inbound image attachments into the profile's scratch dir (always in
+// --add-dir and sandbox-writable) and append a pointer so the agent reads them
+// with its Read tool, which renders images natively. Opportunistically prunes
+// files older than a week — no cron needed; every inbound image sweeps the dir.
+async function materializeAttachments(cwd, message, attachments) {
+  if (!attachments || attachments.length === 0) return message
+  const mediaDir = path.join(cwd, MEDIA_DIRNAME)
+  await mkdir(mediaDir, { recursive: true })
+
+  const now = Date.now()
+  for (const f of await readdir(mediaDir).catch(() => [])) {
+    const p = path.join(mediaDir, f)
+    try {
+      const st = await stat(p)
+      if (now - st.mtimeMs > MEDIA_MAX_AGE_MS) await unlink(p)
+    } catch { /* concurrent prune / gone — ignore */ }
+  }
+
+  const pointers = []
+  for (const att of attachments) {
+    if (!att?.buffer?.length) continue
+    const fname = `${now}-${randomUUID().slice(0, 8)}.${extFor(att)}`
+    const abs = path.join(mediaDir, fname)
+    await writeFile(abs, att.buffer)
+    pointers.push(`[image]: saved to ${abs} — view it with the Read tool`)
+  }
+  if (pointers.length === 0) return message
+  const joined = pointers.join('\n')
+  return message ? `${message}\n\n${joined}` : joined
+}
+
 async function resolveAreaDirs(areas) {
-  let names = areas
   if (areas.includes('*')) {
-    const { readdir } = await import('node:fs/promises')
+    // Wildcard: bind vault/areas/ itself, not per-subdir. This lets a
+    // wildcard profile (e.g. knowledge) create new top-level areas on the
+    // fly and have those writes persist on the host — the failure mode that
+    // wiped the 2026-05-25 reorg was per-subdir binds + tmpfs $HOME causing
+    // destinations under unbound new dirs to live only in sandbox memory.
+    // Other profiles (per-area scoped) still get individual --bind per area
+    // below; their kernel-level scoping is unchanged.
     const base = path.join(config.vaultDir, 'areas')
+    await mkdir(base, { recursive: true })
+    // Still enumerate current children for the bridge-context message so
+    // the agent's first-turn system prompt names the concrete areas, not '*'.
+    let names = []
     try {
       const entries = await readdir(base, { withFileTypes: true })
       names = entries.filter((e) => e.isDirectory()).map((e) => e.name)
-    } catch {
-      names = []
-    }
+    } catch { /* empty vault/areas/ on fresh setup */ }
+    return { areas: names, dirs: [base] }
   }
   const dirs = []
-  for (const a of names) {
+  for (const a of areas) {
     if (!/^[a-z0-9_-]+$/i.test(a)) continue
     dirs.push(await ensureAreaDirs(a))
   }
-  return { areas: names, dirs }
+  return { areas, dirs }
 }
 
 async function profileDirsForAddDir(profile) {
@@ -202,13 +261,13 @@ function bridgeContext({ user, profile, areas, extraRepos = [] }) {
 }
 
 // ----- Subprocess environment builder -----
-// The host process inherits a lot of env: every key in .env, every key the
-// systemd unit ships, every key the operator set in their shell. We do NOT
-// pass that wholesale to subprocesses — a notes-agent shouldn't see a Slack
-// bot token or another profile's API key just because they happen to live in
-// the same process. The agent's env is built from scratch: a small allowlist
-// of OS-required vars, optional ANTHROPIC_API_KEY per billing, and exactly
-// the keys the profile declares in permissions.json's `env:` map.
+// The host process inherits everything in .env, every key the systemd unit
+// ships, and every key the operator set in their shell. We do NOT pass that
+// wholesale to subprocesses — a notes-agent shouldn't see a Slack bot token
+// or another profile's API key just because they happen to live in the same
+// process. Each subprocess env is built from scratch: a tiny allowlist of
+// OS-required vars, optional ANTHROPIC_API_KEY per billing, and exactly the
+// keys the profile declares in permissions.json's `env:` map.
 
 const BASE_PASSTHROUGH = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR']
 
@@ -239,20 +298,14 @@ function buildSubprocessEnv(profile) {
 // Strict-sandbox profiles run inside a fresh kernel namespace whose filesystem
 // view contains ONLY: a read-only /usr (+ /etc) for system binaries, a fresh
 // /tmp tmpfs, an empty /home with select dotdirs bound in for the agent CLI's
-// own state (~/.claude, ~/.local/bin, etc.), and the read-write dirs the
-// profile is granted. Everything else (`.env`, `users.json`, the repo root,
-// other profile dirs, /root, /home/<other-user>) doesn't exist in the
-// namespace — `cat /etc/passwd` works (it's in /etc) but `cat /home/occams/
-// occams-agent/.env` fails with "no such file or directory" even from Bash,
-// even from a sub-spawned process, because the path isn't there.
+// own state (~/.claude, ~/.local/bin, etc.), the read-write dirs the profile
+// is granted, and a short list of shared read-only repo resources (the wiki
+// schema, .mcp.json, scripts/, plus any SHARED_BIND_PATHS) that every agent
+// legitimately needs. Everything else — `.env`, `users.json`,
+// `permissions.json`, the repo root, other profile dirs — doesn't exist in
+// the namespace. Network stays unrestricted.
 //
-// Network is shared with the host so API calls (Anthropic, Slack, fetch)
-// still work. Use a separate `--unshare-net` rule + reverse proxy if you
-// also want network isolation.
-//
-// Linux-only. On macOS we log a warning once and run unsandboxed; Claude's
-// own sandbox on darwin (sandbox-exec) is a separate mechanism we don't wire
-// up here.
+// Linux-only. On macOS / no-bwrap we log a one-time warning and run unsandboxed.
 
 let bwrapWarned = false
 
@@ -269,15 +322,18 @@ const BWRAP_PATH = findBwrap()
 // Shared read-only resources that every agent legitimately needs, even when
 // sandboxed. Vault CLAUDE.md/AGENTS.md are read by Claude/Codex on every turn
 // via parent-walk discovery from cwd; .mcp.json registers MCP servers;
-// scripts/ holds shared bash helpers; /opt/* paths host MCP server binaries
-// installed system-wide. We bind whatever exists; missing entries are silently
-// skipped.
+// scripts/ holds shared bash helpers an agent may shell out to. Anything
+// host-specific (e.g. an MCP server binary under /opt) goes in the
+// SHARED_BIND_PATHS env var (comma-separated absolute paths) rather than
+// being hardcoded here. We bind whatever exists; missing entries are
+// silently skipped.
 function sharedReadOnlyPaths() {
   const candidates = [
     path.join(config.repoRoot, 'vault', 'CLAUDE.md'),
     path.join(config.repoRoot, 'vault', 'AGENTS.md'),
     path.join(config.repoRoot, '.mcp.json'),
     path.join(config.repoRoot, 'scripts'),
+    ...config.sharedBindPaths,
   ]
   return candidates.filter((p) => existsSync(p))
 }
@@ -300,10 +356,25 @@ function bwrapPrefixArgs(allowedRwDirs) {
     '--symlink', 'usr/sbin', '/sbin',
   ]
 
-  // HOME: tmpfs with selected dotdirs bound in so the agent CLI's own state
-  // (OAuth, npm cache, installed binary) is reachable. RW so the CLI can keep
-  // writing its session/cache files. ~/.gitconfig is bound read-only so that
-  // `git commit` works inside the sandbox (it needs user.name + user.email).
+  // /etc/resolv.conf is typically a symlink into /run (systemd-resolved:
+  // ../run/systemd/resolve/stub-resolv.conf). --tmpfs /run wipes the target,
+  // so the symlink dangles and DNS dies in the sandbox ("could not resolve
+  // host"). We can't bind onto the symlink itself — /etc is read-only and
+  // bwrap resolves the dest through the dead symlink ("Can't create file at
+  // /etc/resolv.conf"). Instead bind the resolved host file onto the symlink's
+  // absolute target, which lives under the /run tmpfs where bwrap can create
+  // it; the untouched /etc symlink then resolves correctly. If resolv.conf is
+  // a plain file (not a symlink), the read-only /etc bind already exposes it.
+  try {
+    const rc = '/etc/resolv.conf'
+    if (lstatSync(rc).isSymbolicLink()) {
+      const target = realpathSync(rc)
+      if (target !== rc && existsSync(target)) {
+        args.push('--ro-bind', target, target)
+      }
+    }
+  } catch { /* no resolver file on host — leave DNS to whatever /etc provides */ }
+
   const home = process.env.HOME
   if (home) {
     args.push('--tmpfs', home)
@@ -311,6 +382,14 @@ function bwrapPrefixArgs(allowedRwDirs) {
       const p = path.join(home, sub)
       if (existsSync(p)) args.push('--bind', p, p)
     }
+    // The Claude CLI keeps its subscription/OAuth credential + global config in
+    // ~/.claude.json (a FILE, not under ~/.claude/). Without this, strict-sandbox
+    // billing:subscription profiles start unauthenticated, write a stub, exit 1;
+    // billing:api profiles hit the same config-not-found failure. Read-only so a
+    // buggy/rogue agent can't corrupt the shared credential for every other agent
+    // (the 50-byte-stub clobber diagnosed 2026-05-17).
+    const claudeJson = path.join(home, '.claude.json')
+    if (existsSync(claudeJson)) args.push('--ro-bind', claudeJson, claudeJson)
     const gitconfig = path.join(home, '.gitconfig')
     if (existsSync(gitconfig)) args.push('--ro-bind', gitconfig, gitconfig)
   }
@@ -361,6 +440,27 @@ function streamClaude(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId }
     let resultEvent = null
     let settled = false
 
+    // agent_text is delayed by one: the *last* assistant text block is the
+    // final answer (delivered via finalText), so we never want to emit it as
+    // an interim trace event. Buffer the most recent agent_text and only flush
+    // it once a later event proves it wasn't the last. The result event (or
+    // stream end) discards whatever is still buffered.
+    let pendingAgentText = null
+    const dispatch = (normalized) => {
+      for (const ne of normalized) {
+        if (ne.type === 'agent_text') {
+          if (pendingAgentText) emitNormalized(onEvent, [pendingAgentText])
+          pendingAgentText = ne
+        } else {
+          if (pendingAgentText) {
+            emitNormalized(onEvent, [pendingAgentText])
+            pendingAgentText = null
+          }
+          emitNormalized(onEvent, [ne])
+        }
+      }
+    }
+
     // Idle timeout: reset on every stream event. A genuinely-hung process gets
     // killed; an actively-streaming long run sails through.
     let idleTimer
@@ -369,7 +469,7 @@ function streamClaude(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId }
       idleTimer = setTimeout(() => {
         if (settled) return
         settled = true
-        terminateProcessTree(proc)
+        proc.kill('SIGTERM')
         reject(new Error(`claude idle for ${timeoutMs}ms — killed`))
       }, timeoutMs)
     }
@@ -385,6 +485,8 @@ function streamClaude(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId }
       if (evt.type === 'result') {
         resultEvent = evt
         if (typeof evt.result === 'string') finalText = evt.result
+        // The buffered agent_text is the final answer — drop it, don't echo.
+        pendingAgentText = null
       } else if (evt.type === 'assistant' && Array.isArray(evt.message?.content)) {
         // Fallback for accumulating assistant text if no result event arrives.
         for (const block of evt.message.content) {
@@ -394,7 +496,7 @@ function streamClaude(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId }
         }
       }
 
-      emitNormalized(onEvent, normalizeClaudeEvent(evt))
+      dispatch(normalizeClaudeEvent(evt))
     })
 
     proc.stderr.on('data', (d) => { stderr += d.toString() })
@@ -435,8 +537,9 @@ function streamClaude(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId }
   })
 }
 
-async function runClaude({ profile, user, chatId, message, timeoutMs, onEvent }) {
+async function runClaude({ profile, user, chatId, message, attachments, timeoutMs, onEvent, model }) {
   const cwd = await ensureProfileScratch(profile.slug)
+  message = await materializeAttachments(cwd, message, attachments)
   const { areas, dirs: areaDirs } = await resolveAreaDirs(profile.areas)
   const profileDirs = await profileDirsForAddDir(profile)
   const extraRepos = await resolveExtraRepos({ profile, chatId })
@@ -458,6 +561,18 @@ async function runClaude({ profile, user, chatId, message, timeoutMs, onEvent })
     '--permission-mode', config.claude.permissionMode,
     '--append-system-prompt', bridgeContext({ user, profile, areas, extraRepos }),
   ]
+  // Model: per-call override (cron spec) wins over per-profile default
+  // (permissions.json). Unset on both => CLI default. e.g. a profile can pin
+  // "claude-sonnet-4-6"; a one-off cron can pass model: "claude-haiku-4-5".
+  const effectiveModel = model || profile.model
+  if (effectiveModel) args.push('--model', effectiveModel)
+  if (profile.effort) args.push('--effort', profile.effort)
+  // Per-profile tool denylist (e.g. keep an MCP server's read tools while
+  // blocking its write tools). Variadic flag, so it must come before --add-dir
+  // below — the CLI stops consuming at the next flag.
+  if (profile.deny_tools?.length) {
+    args.push('--disallowed-tools', ...profile.deny_tools)
+  }
   const addDirs = [...profileDirs, ...areaDirs, ...repoBindDirs, cwd]
   if (addDirs.length > 0) {
     args.push('--add-dir', ...addDirs)
@@ -507,7 +622,7 @@ function streamCodex(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId })
       idleTimer = setTimeout(() => {
         if (settled) return
         settled = true
-        terminateProcessTree(proc)
+        proc.kill('SIGTERM')
         reject(new Error(`codex idle for ${timeoutMs}ms — killed`))
       }, timeoutMs)
     }
@@ -561,8 +676,9 @@ function streamCodex(cmd, args, env, { input, cwd, timeoutMs, onEvent, chatId })
   })
 }
 
-async function runCodex({ profile, user, chatId, message, timeoutMs, onEvent }) {
+async function runCodex({ profile, user, chatId, message, attachments, timeoutMs, onEvent, model }) {
   const cwd = await ensureProfileScratch(profile.slug)
+  message = await materializeAttachments(cwd, message, attachments)
   const { areas, dirs: areaDirs } = await resolveAreaDirs(profile.areas)
   const profileDirs = await profileDirsForAddDir(profile)
   const extraRepos = await resolveExtraRepos({ profile, chatId })
@@ -578,14 +694,14 @@ async function runCodex({ profile, user, chatId, message, timeoutMs, onEvent }) 
   if (config.codex.bypassApprovals) {
     baseArgs.push('-c', 'approval_policy="never"')
   }
+  // Model: per-call override wins over profile default. Codex uses -c overrides
+  // rather than a --model flag.
+  const effectiveModel = model || profile.model
+  if (effectiveModel) baseArgs.push('-c', `model="${effectiveModel}"`)
   for (const dir of [...profileDirs, ...areaDirs, ...repoBindDirs]) {
     baseArgs.push('--add-dir', dir)
   }
 
-  // Codex has its own kernel-level sandbox (seatbelt/landlock) controlled via
-  // --sandbox. We leave it at workspace-write so the agent can write to its
-  // scratch + areas; bwrap is what enforces what "workspace" looks like in
-  // the namespace for strict-sandbox profiles.
   let args
   if (existing) {
     args = ['exec', 'resume', existing, ...baseArgs, '-']
@@ -631,14 +747,12 @@ const chatLocks = new Map()
 function withChatLock(key, fn) {
   const prev = chatLocks.get(key) ?? Promise.resolve()
   const next = prev.then(fn, fn)
-  const stored = next.finally(() => {
-    if (chatLocks.get(key) === stored) chatLocks.delete(key)
-  })
-  chatLocks.set(key, stored)
+  const cleanup = () => { if (chatLocks.get(key) === next) chatLocks.delete(key) }
+  chatLocks.set(key, next.then(cleanup, cleanup))
   return next
 }
 
-export async function runAgent({ cliAgent, profile, user, chatId, message, timeoutMs = DEFAULT_TIMEOUT_MS, onEvent }) {
+export async function runAgent({ cliAgent, profile, user, chatId, message, attachments = [], timeoutMs = DEFAULT_TIMEOUT_MS, onEvent, channel = 'unknown', model }) {
   if (!SUPPORTED.has(cliAgent)) {
     throw new Error(`Unknown CLI agent "${cliAgent}". Use one of: ${[...SUPPORTED].join(', ')}`)
   }
@@ -646,8 +760,32 @@ export async function runAgent({ cliAgent, profile, user, chatId, message, timeo
   if (!chatId) throw new Error('runAgent: chatId is required')
   if (!user) throw new Error('runAgent: user is required')
 
-  return withChatLock(chatId, () => {
-    if (cliAgent === 'claude') return runClaude({ profile, user, chatId, message, timeoutMs, onEvent })
-    if (cliAgent === 'codex')  return runCodex({  profile, user, chatId, message, timeoutMs, onEvent })
+  const run = await recordRunQueued({
+    chatId,
+    profile: profile.slug,
+    userSlug: user.slug,
+    channel,
+    message,
+  })
+
+  return withChatLock(chatId, async () => {
+    await recordRunStarted(run.id)
+    const trackedOnEvent = (evt) => {
+      recordRunEvent(run.id, evt).catch((err) => console.error('[registry] recordRunEvent failed:', err.message))
+      if (!onEvent) return
+      return onEvent(evt)
+    }
+
+    try {
+      const reply = cliAgent === 'claude'
+        ? await runClaude({ profile, user, chatId, message, attachments, timeoutMs, onEvent: trackedOnEvent, model })
+        : await runCodex({ profile, user, chatId, message, attachments, timeoutMs, onEvent: trackedOnEvent, model })
+      await recordRunFinished(run.id, { status: 'completed', reply })
+      return reply
+    } catch (err) {
+      const status = err.name === 'StoppedError' ? 'stopped' : 'failed'
+      await recordRunFinished(run.id, { status, error: err.message })
+      throw err
+    }
   })
 }

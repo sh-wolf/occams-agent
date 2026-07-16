@@ -1,68 +1,96 @@
-import { randomUUID } from 'node:crypto'
-import { readdir, readFile, writeFile, unlink, mkdir } from 'node:fs/promises'
+import { readdir, readFile, writeFile, unlink, mkdir, access } from 'node:fs/promises'
 import path from 'node:path'
 import cron from 'node-cron'
 import { config } from './config.js'
 
 const SLUG_RE = /^[a-z0-9_-]+$/i
-const LOCAL_ISO_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/
-
-function assertSlug(value, label) {
-  if (typeof value !== 'string' || !SLUG_RE.test(value)) {
-    throw new Error(`Invalid ${label}: ${value}`)
-  }
-}
 
 function jobsDir(slug) {
-  assertSlug(slug, 'profile slug')
   return path.join(config.vaultDir, 'users', slug, 'jobs')
 }
 
 function jobPath(slug, id) {
-  assertSlug(id, 'job id')
+  if (!SLUG_RE.test(id)) throw new Error(`Invalid job id: ${id}`)
   return path.join(jobsDir(slug), `${id}.json`)
 }
 
 export async function listJobs(slug) {
-  const dir = jobsDir(slug)
   let files = []
   try {
-    files = await readdir(dir)
+    files = await readdir(jobsDir(slug))
   } catch {
     return []
   }
-  const jobs = await Promise.all(files.filter((f) => f.endsWith('.json')).map(async (f) => {
-    const id = f.slice(0, -5)
+  const jobs = []
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue
+    const id = f.replace(/\.json$/, '')
     try {
-      const spec = JSON.parse(await readFile(path.join(dir, f), 'utf8'))
-      return { id, ...spec }
+      const spec = JSON.parse(await readFile(path.join(jobsDir(slug), f), 'utf8'))
+      jobs.push({ id, ...spec })
     } catch (err) {
-      return { id, error: err.message }
+      jobs.push({ id, error: err.message })
     }
-  }))
+  }
   return jobs.sort((a, b) => a.id.localeCompare(b.id))
 }
 
-export async function removeJob(slug, id) {
+export async function listAllJobs() {
+  let entries = []
+  try {
+    entries = await readdir(path.join(config.vaultDir, 'users'), { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const out = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const slug = entry.name
+    for (const job of await listJobs(slug)) {
+      out.push({ profile: slug, ...job })
+    }
+  }
+  return out.sort((a, b) => `${a.profile}/${a.id}`.localeCompare(`${b.profile}/${b.id}`))
+}
+
+export async function getJob(slug, id) {
   const p = jobPath(slug, id)
   try {
-    await unlink(p)
+    return JSON.parse(await readFile(p, 'utf8'))
   } catch (err) {
     if (err.code === 'ENOENT') throw new Error(`No job named "${id}"`)
     throw err
   }
 }
 
-export async function createJob(slug, id, spec) {
+export async function removeJob(slug, id) {
   const p = jobPath(slug, id)
-  await mkdir(path.dirname(p), { recursive: true })
-  await writeFile(p, JSON.stringify(spec, null, 2) + '\n')
+  try {
+    await access(p)
+  } catch {
+    throw new Error(`No job named "${id}"`)
+  }
+  await unlink(p)
+}
+
+export async function createJob(slug, id, spec) {
+  if (!SLUG_RE.test(id)) throw new Error(`Invalid job id: ${id}`)
+  await mkdir(jobsDir(slug), { recursive: true })
+  await writeFile(jobPath(slug, id), JSON.stringify(spec, null, 2) + '\n')
+}
+
+export async function updateJob(slug, id, patch) {
+  const current = await getJob(slug, id)
+  const next = { ...current, ...patch }
+  if (!validateCron(next.schedule)) throw new Error(`Invalid cron expression: ${next.schedule}`)
+  if (!next.prompt) throw new Error('Prompt is required.')
+  await createJob(slug, id, next)
+  return next
 }
 
 export function makeJobId(prefix = 'cron') {
-  assertSlug(prefix, 'job id prefix')
   const ts = new Date().toISOString().replace(/[-:.]/g, '').slice(0, 14)
-  const rand = randomUUID().slice(0, 8)
+  const rand = Math.random().toString(36).slice(2, 6)
   return `${prefix}-${ts}-${rand}`
 }
 
@@ -70,58 +98,11 @@ export function validateCron(expr) {
   return cron.validate(expr)
 }
 
-function zonedParts(date, timezone) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    hourCycle: 'h23',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).formatToParts(date)
-  return Object.fromEntries(parts.filter((p) => p.type !== 'literal').map((p) => [p.type, Number(p.value)]))
-}
-
-function timezoneOffsetMs(date, timezone) {
-  const p = zonedParts(date, timezone)
-  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
-  return asUtc - date.getTime()
-}
-
-function zonedLocalToDate({ year, month, day, hour, minute, second = 0 }, timezone) {
-  const guess = Date.UTC(year, month - 1, day, hour, minute, second)
-  const first = guess - timezoneOffsetMs(new Date(guess), timezone)
-  const secondPass = guess - timezoneOffsetMs(new Date(first), timezone)
-  return new Date(secondPass)
-}
-
-export function isoToCron(iso, timezone = config.scheduler.defaultTimezone) {
-  const local = LOCAL_ISO_RE.exec(iso)
-  if (local) {
-    const [, year, month, day, hour, minute, second] = local
-    const parts = {
-      year: Number(year),
-      month: Number(month),
-      day: Number(day),
-      hour: Number(hour),
-      minute: Number(minute),
-      second: Number(second ?? 0),
-    }
-    const when = zonedLocalToDate(parts, timezone)
-    if (Number.isNaN(when.getTime())) return null
-    return {
-      expr: `${parts.minute} ${parts.hour} ${parts.day} ${parts.month} *`,
-      when,
-    }
-  }
-
+export function isoToCron(iso) {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return null
-  const p = zonedParts(d, timezone)
   return {
-    expr: `${p.minute} ${p.hour} ${p.day} ${p.month} *`,
+    expr: `${d.getMinutes()} ${d.getHours()} ${d.getDate()} ${d.getMonth() + 1} *`,
     when: d,
   }
 }

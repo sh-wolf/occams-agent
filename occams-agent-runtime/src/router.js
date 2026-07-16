@@ -19,6 +19,14 @@ import {
   isoToCron,
 } from './jobs.js'
 import {
+  createChat,
+  getChat,
+  getTask,
+  linkChatAlias,
+  resolveChatAlias,
+  updateChat,
+} from './registry.js'
+import {
   listChatWorktrees,
   submitWorktree,
   removeChatWorktrees,
@@ -27,7 +35,8 @@ import path from 'node:path'
 
 const RUNTIME_PREFIXES = new Set([
   'help', 'whoami', 'profiles', 'reset', 'new', 'forget',
-  'jobs', 'cron', 'claude', 'codex', 'streaming', 'stop', 'submit',
+  'jobs', 'cron', 'claude', 'codex', 'streaming', 'stop',
+  'resume', 'task', 'submit',
 ])
 
 function parseMessage(text, profileSlugs) {
@@ -59,6 +68,12 @@ function parseMessage(text, profileSlugs) {
   }
   if (/^\/streaming\b/i.test(trimmed)) {
     return { kind: 'streaming', rest: trimmed.replace(/^\/streaming\s*/i, '').trim() }
+  }
+  if (/^\/resume\b/i.test(trimmed)) {
+    return { kind: 'resume', rest: trimmed.replace(/^\/resume\s*/i, '').trim(), profileOverride }
+  }
+  if (/^\/task\b/i.test(trimmed)) {
+    return { kind: 'task', rest: trimmed.replace(/^\/task\s*/i, '').trim(), profileOverride }
   }
   // /stop must dispatch OUTSIDE runAgent — see handleMessage. Don't move this
   // into the agent path or it'll queue behind the very process it's killing.
@@ -129,17 +144,45 @@ const HELP_TEXT = [
   `Default CLI: ${config.defaultAgent}`,
 ].join('\n')
 
-async function resolveProfile(parsed, chatId, profiles) {
+// A user restricted to exactly one existing profile has no ambiguity about
+// which agent they mean — start them in it directly instead of bouncing them
+// off the global default they can't use. "*" or an unset/empty list means
+// all-access, which is NOT a sole profile.
+function soleAccessibleProfile(user, profiles) {
+  if (!user || !Array.isArray(user.profiles)) return null
+  if (user.profiles.length === 0 || user.profiles.includes('*')) return null
+  const accessible = profiles.filter((p) => user.profiles.includes(p.slug))
+  return accessible.length === 1 ? accessible[0] : null
+}
+
+async function resolveProfile(parsed, chatId, profiles, user) {
   if (parsed.profileOverride) {
     const profile = profiles.find((p) => p.slug === parsed.profileOverride)
     if (!profile) return null
     await setProfileBinding(chatId, profile.slug)
+    // Keep the control-plane registry in sync with an interactive switch.
+    // Without this, a bare `/<slug>` updates only the session binding; the
+    // registry keeps the old profile and re-pins it on the next non-override
+    // message (see handleMessage), silently reverting the switch. No-op when
+    // no registry chat exists yet — the first run will create it correctly.
+    await updateChat(chatId, { profile: profile.slug }).catch(() => {})
     return profile
   }
   const bound = await getProfileBinding(chatId)
   if (bound) {
     const p = profiles.find((x) => x.slug === bound)
-    if (p) return p
+    // Ignore a stale binding to a profile this user can no longer use (e.g. a
+    // chat previously bound to /admin, now used by a single-profile teammate) —
+    // fall through so they land on an agent they're actually allowed to use.
+    if (p && userCanUseProfile(user, p.slug)) return p
+  }
+  // Single-profile users: auto-start their one agent instead of the global
+  // default profile, which they may have no access to.
+  const sole = soleAccessibleProfile(user, profiles)
+  if (sole) {
+    await setProfileBinding(chatId, sole.slug)
+    await updateChat(chatId, { profile: sole.slug }).catch(() => {})
+    return sole
   }
   return getDefaultProfile()
 }
@@ -174,7 +217,7 @@ async function handleJobsCommand({ profile, rest }) {
     for (const j of jobs) {
       if (j.error) { lines.push(`• ${j.id}: ⚠️ ${j.error}`); continue }
       const snippet = (j.prompt ?? '').slice(0, 60) + ((j.prompt ?? '').length > 60 ? '…' : '')
-      const tz = ` ${j.timezone ?? config.scheduler.defaultTimezone}`
+      const tz = j.timezone ? ` ${j.timezone}` : ''
       const once = j.runOnce ? ' (once)' : ''
       const cli = j.agent_cli ?? j.agent ?? config.defaultAgent
       lines.push(
@@ -206,7 +249,7 @@ async function handleCronCommand({ profile, user, channel, rest }) {
   if (/^once\s/i.test(rest)) {
     const m = /^once\s+(\S+)\s+(.+)$/is.exec(rest)
     if (!m) return 'Usage: `/cron once <YYYY-MM-DDTHH:MM> <prompt>`'
-    const parsed = isoToCron(m[1], config.scheduler.defaultTimezone)
+    const parsed = isoToCron(m[1])
     if (!parsed) return `Couldn't parse "${m[1]}" as a datetime. Try ISO format like 2026-05-12T15:00.`
     if (parsed.when < new Date()) return `That time is in the past (${parsed.when.toISOString()}).`
     spec = {
@@ -215,7 +258,6 @@ async function handleCronCommand({ profile, user, channel, rest }) {
       prompt: m[2].trim(),
       deliver_to: deliverTo,
       runOnce: true,
-      timezone: config.scheduler.defaultTimezone,
     }
   } else {
     const tokens = rest.split(/\s+/)
@@ -230,13 +272,12 @@ async function handleCronCommand({ profile, user, channel, rest }) {
       prompt,
       deliver_to: deliverTo,
       runOnce: false,
-      timezone: config.scheduler.defaultTimezone,
     }
   }
 
   const id = makeJobId()
   await createJob(profile.slug, id, spec)
-  return `Scheduled ${id} under /${profile.slug}: \`${spec.schedule}\`${spec.runOnce ? ' (once)' : ''} ${spec.timezone} → ${spec.deliver_to}`
+  return `Scheduled ${id} under /${profile.slug}: \`${spec.schedule}\`${spec.runOnce ? ' (once)' : ''} → ${spec.deliver_to}`
 }
 
 async function handleSubmitCommand({ profile, chatId, title }) {
@@ -256,7 +297,46 @@ async function handleSubmitCommand({ profile, chatId, title }) {
   return lines.join('\n')
 }
 
-export async function handleMessage({ text, chatId, channel, user, onEvent }) {
+async function handleResumeCommand({ rawChatId, channel, user, rest }) {
+  const targetChatId = rest.split(/\s+/)[0]
+  if (!targetChatId) return 'Usage: `/resume <chat-id>`'
+  const chat = await getChat(targetChatId)
+  if (!chat) return `No dashboard chat found for "${targetChatId}".`
+  await linkChatAlias(rawChatId, targetChatId, { channel, userSlug: user.slug })
+  if (chat.profile) await setProfileBinding(targetChatId, chat.profile)
+  return `Resumed ${targetChatId}${chat.title ? ` (${chat.title})` : ''} in this ${channel} thread.`
+}
+
+async function handleTaskCommand({ rawChatId, channel, user, rest, parsed, profiles }) {
+  const taskId = rest.split(/\s+/)[0]
+  if (!taskId) return 'Usage: `/task <task-id>`'
+  const task = await getTask(taskId)
+  if (!task) return `No dashboard task found for "${taskId}".`
+
+  let chatId = task.chatIds?.[0]
+  let chat = chatId ? await getChat(chatId) : null
+
+  if (!chat) {
+    const profile = await resolveProfile(parsed, rawChatId, profiles, user)
+    if (!profile) return 'No profile selected. Use `/<profile> /task <task-id>` or bind this chat to a profile first.'
+    if (!userCanUseProfile(user, profile.slug)) return `You don't have access to /${profile.slug}.`
+    chat = await createChat({
+      title: task.title,
+      profile: profile.slug,
+      userSlug: user.slug,
+      taskId,
+    })
+    chatId = chat.id
+    await setProfileBinding(chatId, profile.slug)
+  }
+
+  await linkChatAlias(rawChatId, chatId, { channel, userSlug: user.slug })
+  if (chat.profile) await setProfileBinding(chatId, chat.profile)
+  return `Bound this ${channel} thread to task ${taskId} via chat ${chatId}.`
+}
+
+export async function handleMessage({ text, chatId, channel, user, onEvent, attachments = [] }) {
+  const rawChatId = chatId
   const profiles = await listProfiles()
   const profileSlugs = new Set(profiles.map((p) => p.slug))
   const parsed = parseMessage(text, profileSlugs)
@@ -267,6 +347,15 @@ export async function handleMessage({ text, chatId, channel, user, onEvent }) {
     const bound = await getProfileBinding(chatId)
     return formatProfiles(profiles, bound)
   }
+  if (parsed.kind === 'resume') return handleResumeCommand({ rawChatId, channel, user, rest: parsed.rest })
+  if (parsed.kind === 'task') return handleTaskCommand({ rawChatId, channel, user, rest: parsed.rest, parsed, profiles })
+
+  chatId = await resolveChatAlias(rawChatId)
+  const registryChat = await getChat(chatId)
+  if (registryChat?.profile && !parsed.profileOverride) {
+    await setProfileBinding(chatId, registryChat.profile)
+  }
+
   if (parsed.kind === 'forget') {
     // Clean up any external-repo worktrees that belonged to this chat before
     // we throw away the binding. We need the bound profile to know whose
@@ -291,7 +380,7 @@ export async function handleMessage({ text, chatId, channel, user, onEvent }) {
     return stopped ? 'Stopped.' : 'Nothing to stop.'
   }
 
-  const profile = await resolveProfile(parsed, chatId, profiles)
+  const profile = await resolveProfile(parsed, chatId, profiles, user)
   if (!profile) {
     return 'No profile selected for this chat. Send `/profiles` to see options, then `/<slug>` to bind.'
   }
@@ -323,7 +412,9 @@ export async function handleMessage({ text, chatId, channel, user, onEvent }) {
       user,
       chatId,
       message: parsed.message,
+      attachments,
       onEvent,
+      channel,
     })
     return reply || '(no output)'
   } catch (err) {

@@ -14,6 +14,7 @@ import { config } from './config.js'
 
 const SANDBOXES = new Set(['full', 'strict'])
 const BILLINGS = new Set(['subscription', 'api'])
+const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 const REPO_MODES = new Set(['pr', 'direct'])
 const SLUG_RE = /^[a-z0-9_-]+$/
 const ENV_RE = /^[A-Z][A-Z0-9_]*$/
@@ -79,9 +80,38 @@ function validateProfile(slug, entry) {
     throw new Error(`permissions.json: profile "${slug}" is superuser; sandbox must be "full"`)
   }
 
+  // Optional per-profile model + reasoning effort. Unset => the claude CLI
+  // default. Passed straight to `claude --model` / `--effort`.
+  const model = entry.model ?? null
+  if (model !== null && (typeof model !== 'string' || !model.trim())) {
+    throw new Error(`permissions.json: profile "${slug}".model must be a non-empty string`)
+  }
+  const effort = entry.effort ?? null
+  if (effort !== null && !EFFORTS.has(effort)) {
+    throw new Error(`permissions.json: profile "${slug}".effort must be one of: ${[...EFFORTS].join(', ')}`)
+  }
+
+  // Optional per-profile default for the live "show thinking" trace. When
+  // false, chats on this profile start with streaming off (a "working…"
+  // placeholder that's replaced by the answer) unless the user flips it with
+  // /streaming. Unset => the global default (on).
+  const streaming = entry.streaming ?? null
+  if (streaming !== null && typeof streaming !== 'boolean') {
+    throw new Error(`permissions.json: profile "${slug}".streaming must be true or false`)
+  }
+
   const extra_repos = validateExtraRepos(slug, entry.extra_repos ?? [])
 
-  return { areas: entry.areas, superuser: entry.superuser, sandbox, billing, env, extra_repos }
+  // Optional per-profile tool denylist, passed straight to `claude
+  // --disallowed-tools`. Lets a profile keep a subset of an MCP server while
+  // blocking the rest (e.g. keep an MCP's read tools, deny its write tools).
+  // Claude CLI only (the codex path does not apply it).
+  const deny_tools = entry.deny_tools ?? []
+  if (!Array.isArray(deny_tools) || deny_tools.some((t) => typeof t !== 'string' || !t.trim())) {
+    throw new Error(`permissions.json: profile "${slug}".deny_tools must be an array of non-empty strings`)
+  }
+
+  return { areas: entry.areas, superuser: entry.superuser, sandbox, billing, env, extra_repos, model, effort, streaming, deny_tools }
 }
 
 function validateExtraRepos(slug, repos) {

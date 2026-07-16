@@ -1,11 +1,13 @@
 import cron from 'node-cron'
 import { readdir, readFile, unlink, mkdir, appendFile } from 'node:fs/promises'
 import { watch } from 'node:fs'
+import { exec } from 'node:child_process'
 import path from 'node:path'
 import { config } from './config.js'
 import { runAgent } from './agent.js'
 import { findUserBySlug } from './users.js'
 import { loadProfile } from './profiles.js'
+import { recordJobFinished, recordJobStarted } from './registry.js'
 
 const tasks = new Map() // filePath -> { task, slug, spec }
 const watchers = new Map() // slug -> debounce timer
@@ -85,16 +87,65 @@ async function registerJob(slug, filePath) {
     existing.task.stop()
   }
 
-  const timezone = spec.timezone ?? config.scheduler.defaultTimezone
-  const opts = { timezone }
+  const opts = spec.timezone ? { timezone: spec.timezone } : {}
   const task = cron.schedule(spec.schedule, () => {
-    fireJob(slug, filePath, spec).catch((err) => {
-      console.error(`[scheduler] job ${filePath} failed: ${err.message}`)
-    })
+    // Skip if the previous invocation of THIS job is still running. node-cron
+    // fires on every interval boundary regardless; without this guard a job
+    // slower than its interval stacks up concurrent runs (e.g. a triage sweep
+    // on a 1-min test schedule spawned ~10 overlapping sandboxes).
+    const entry = tasks.get(filePath)
+    if (entry?.running) {
+      console.warn(`[scheduler] skip ${path.relative(config.vaultDir, filePath)} — previous run still in progress`)
+      return
+    }
+    if (entry) entry.running = true
+    fireJob(slug, filePath, spec)
+      .catch((err) => {
+        console.error(`[scheduler] job ${filePath} failed: ${err.message}`)
+      })
+      .finally(() => {
+        const e = tasks.get(filePath)
+        if (e) e.running = false
+      })
   }, opts)
 
-  tasks.set(filePath, { task, slug, spec })
-  console.log(`[scheduler] registered ${path.relative(config.vaultDir, filePath)} (${spec.schedule} ${timezone})`)
+  tasks.set(filePath, { task, slug, spec, running: false })
+  console.log(`[scheduler] registered ${path.relative(config.vaultDir, filePath)} (${spec.schedule}${spec.timezone ? ` ${spec.timezone}` : ''})`)
+}
+
+// Optional cheap gate: if the job declares a `precheck` shell command, run it
+// before spawning the (expensive, token-burning) agent. Exit 0 -> proceed;
+// non-zero -> skip this fire entirely, no agent, no registry entry. The
+// scheduler stays dumb — it only inspects the exit code; all policy (what
+// "nothing new" means, and crucially failing OPEN on curl/network/token
+// errors so a broken precheck never silently halts the agent) lives in the
+// precheck script itself, which is editable in the job JSON without a
+// runtime change. Runs in the host process env, which inherits .env, so the
+// precheck has the same secrets the host does.
+function runPrecheck(spec, filePath) {
+  if (!spec.precheck) return Promise.resolve(true)
+  const rel = path.relative(config.vaultDir, filePath)
+  return new Promise((resolve) => {
+    exec(
+      spec.precheck,
+      { timeout: spec.precheck_timeout_ms ?? 20000, env: process.env, shell: '/bin/bash' },
+      (err) => {
+        if (!err) {
+          resolve(true)
+          return
+        }
+        // A launch/timeout failure (no numeric exit code) fails OPEN — we
+        // run the agent rather than silently going dark on a broken gate.
+        if (typeof err.code !== 'number') {
+          console.warn(`[scheduler] precheck for ${rel} errored (${err.message}) — failing open, running agent`)
+          resolve(true)
+          return
+        }
+        console.log(`[scheduler] precheck negative for ${rel} (exit ${err.code}) — skipping fire`)
+        resolve(false)
+      },
+    )
+  })
 }
 
 async function fireJob(slug, filePath, spec) {
@@ -106,30 +157,49 @@ async function fireJob(slug, filePath, spec) {
     return
   }
 
+  // Cheap pre-flight gate. Negative -> don't wake the agent at all (saves the
+  // full session's tokens). A negatively-prechecked runOnce is intentionally
+  // NOT consumed — it keeps waiting until its condition is met.
+  if (!(await runPrecheck(spec, filePath))) return
+
   const jobId = path.basename(filePath, '.json')
   const chatId = `cron:${slug}:${jobId}`
   const cliAgent = spec.agent_cli ?? spec.agent ?? config.defaultAgent
 
   const systemUser = { slug: '__cron__', name: 'scheduled run (no human on the other end)', whatsapp: [], slack: [] }
 
-  const reply = await runAgent({
-    cliAgent,
-    profile,
-    user: systemUser,
-    chatId,
-    message: spec.prompt,
-  })
+  await recordJobStarted({ profile: slug, jobId, schedule: spec.schedule })
 
-  await deliver({ slug, jobId, reply, deliverTo: spec.deliver_to ?? 'file' })
+  let reply
+  try {
+    reply = await runAgent({
+      cliAgent,
+      profile,
+      user: systemUser,
+      chatId,
+      message: spec.prompt,
+      channel: 'cron',
+      model: spec.model,
+    })
 
-  if (spec.runOnce) {
-    await unlink(filePath).catch(() => {})
-    const entry = tasks.get(filePath)
-    if (entry) {
-      entry.task.stop()
-      tasks.delete(filePath)
+    await deliver({ slug, jobId, reply, deliverTo: spec.deliver_to ?? 'file' })
+    await recordJobFinished({ profile: slug, jobId, status: 'completed', reply })
+  } catch (err) {
+    await recordJobFinished({ profile: slug, jobId, status: 'failed', error: err.message })
+    throw err
+  } finally {
+    // A one-shot must fire exactly once and then be gone — even if it threw.
+    // Previously this lived after the try/catch, so a failing runOnce never
+    // self-deleted and re-fired every interval until manually removed.
+    if (spec.runOnce) {
+      await unlink(filePath).catch(() => {})
+      const entry = tasks.get(filePath)
+      if (entry) {
+        entry.task.stop()
+        tasks.delete(filePath)
+      }
+      console.log(`[scheduler] one-shot job ${jobId} consumed`)
     }
-    console.log(`[scheduler] one-shot job ${jobId} consumed`)
   }
 }
 
@@ -171,9 +241,12 @@ function watchSlug(slug) {
   const dir = path.join(config.vaultDir, 'users', slug, 'jobs')
   mkdir(dir, { recursive: true })
     .then(() => {
-      watch(dir, () => {
+      const watcher = watch(dir, () => {
         clearTimeout(watchers.get(slug))
         watchers.set(slug, setTimeout(() => scanSlug(slug).catch(console.error), 300))
+      })
+      watcher.on('error', (err) => {
+        console.error(`[scheduler] watch ${slug} failed after start: ${err.message}`)
       })
     })
     .catch((err) => console.error(`[scheduler] watch ${slug} failed: ${err.message}`))

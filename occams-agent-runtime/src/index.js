@@ -28,6 +28,7 @@ async function main() {
   console.log(`  profiles found:  ${profiles.length ? profiles.map((p) => `/${p.slug}`).join(' ') : '(none — create <slug>-agent/agent-role.md)'}`)
   console.log(`  whatsapp:  ${config.whatsapp.enabled ? 'on' : 'off'}`)
   console.log(`  slack:     ${config.slack.enabled ? 'on' : 'off'}`)
+  console.log(`  webhook:   ${config.webhook.enabled ? `127.0.0.1:${config.webhook.port} → /${config.webhook.profile}` : 'off'}`)
 
   if (!(await exists(config.usersFile))) {
     console.error(`\n⚠️  ${config.usersFile} not found. Copy users.example.json to users.json and edit before any messages will be accepted.\n`)
@@ -45,13 +46,18 @@ async function main() {
     channels[name] = channel
   }
 
-  if (!channels.whatsapp && !channels.slack) {
-    console.error('No channels started. Set ENABLE_WHATSAPP=true or ENABLE_SLACK=true (with valid tokens).')
+  if (!channels.whatsapp && !channels.slack && !config.webhook.enabled) {
+    console.error('No channels started. Set ENABLE_WHATSAPP=true, ENABLE_SLACK=true (with valid tokens), or ENABLE_WEBHOOK=true.')
     process.exit(1)
   }
 
   const { startScheduler } = await import('./scheduler.js')
   await startScheduler({ channels })
+
+  if (config.webhook.enabled) {
+    const { startWebhook } = await import('./webhook.js')
+    await startWebhook()
+  }
 }
 
 async function startChannel(name, modulePath, exportName) {
