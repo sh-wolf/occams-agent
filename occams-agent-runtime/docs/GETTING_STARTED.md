@@ -113,6 +113,8 @@ Defaults are usable. Tweak as needed:
 - `DEFAULT_TIMEZONE=America/New_York` controls scheduled jobs when a job omits `timezone`.
 - `ENABLE_SLACK=true` only if you've set up a Slack app (see [Optional: Slack setup](#optional-slack-setup)).
 - `CLAUDE_PERMISSION_MODE=bypassPermissions` — required for unattended runs.
+- `ENABLE_AGENT_API=true` + a long random `AGENT_API_TOKEN` only if you're wiring up a dashboard or Obsidian plugin. Keep it on `127.0.0.1` (reach it over an SSH tunnel or VPN) — it can drive every profile, admin included.
+- `SHARED_BIND_PATHS=/opt/some-mcp-server` if strict-sandbox profiles need a host-installed binary (e.g. an MCP server) visible inside the namespace.
 
 ### Configure `users.json`
 
@@ -416,6 +418,12 @@ crontab -e
 30 3 * * *  /home/occams/occams-agent/deploy/cron-backup.sh >> /home/occams/cron-backup.log 2>&1
 ```
 
-For 'git push' to work non-interactively, set up an SSH key (`ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519`) and add it as a deploy key (with write access) to the GitHub repo.
+For `git push` to work non-interactively, either:
+- put a fine-grained GitHub token (Contents: read/write on this repo) in `.env` as `GITHUB_BACKUP_TOKEN=...` — the script reads it at run time and never writes it into `.git/config` or a process's argv; or
+- set up an SSH key (`ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519`) and add it as a deploy key (with write access) to the GitHub repo.
+
+The script commits, then fetches and rebases onto `origin/main` before pushing, so commits you make on your laptop aren't clobbered by the nightly snapshot. A real same-line conflict aborts the rebase and exits non-zero (check `cron-backup.log`); nothing is lost, it retries the next night until you reconcile.
+
+Day-to-day operations after the install — pulling updates, when a restart is needed, re-pairing WhatsApp, adding a user, reading the logs — are in [UPDATING.md](UPDATING.md) and [HOWTO.md](HOWTO.md).
 
 Other options: `restic` to S3, or just `tar` to an external disk weekly. Syncthing also works for live two-way sync to a laptop.

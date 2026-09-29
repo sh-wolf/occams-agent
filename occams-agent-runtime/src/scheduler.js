@@ -87,7 +87,8 @@ async function registerJob(slug, filePath) {
     existing.task.stop()
   }
 
-  const opts = spec.timezone ? { timezone: spec.timezone } : {}
+  const timezone = spec.timezone || config.defaultTimezone
+  const opts = timezone ? { timezone } : {}
   const task = cron.schedule(spec.schedule, () => {
     // Skip if the previous invocation of THIS job is still running. node-cron
     // fires on every interval boundary regardless; without this guard a job
@@ -110,7 +111,7 @@ async function registerJob(slug, filePath) {
   }, opts)
 
   tasks.set(filePath, { task, slug, spec, running: false })
-  console.log(`[scheduler] registered ${path.relative(config.vaultDir, filePath)} (${spec.schedule}${spec.timezone ? ` ${spec.timezone}` : ''})`)
+  console.log(`[scheduler] registered ${path.relative(config.vaultDir, filePath)} (${spec.schedule}${timezone ? ` ${timezone}` : ''})`)
 }
 
 // Optional cheap gate: if the job declares a `precheck` shell command, run it
@@ -182,7 +183,7 @@ async function fireJob(slug, filePath, spec) {
       model: spec.model,
     })
 
-    await deliver({ slug, jobId, reply, deliverTo: spec.deliver_to ?? 'file' })
+    await deliver({ slug, jobId, reply, deliverTo: spec.deliver_to ?? 'file', prefix: spec.prefix !== false })
     await recordJobFinished({ profile: slug, jobId, status: 'completed', reply })
   } catch (err) {
     await recordJobFinished({ profile: slug, jobId, status: 'failed', error: err.message })
@@ -203,12 +204,18 @@ async function fireJob(slug, filePath, spec) {
   }
 }
 
-async function deliver({ slug, jobId, reply, deliverTo }) {
-  const text = `[${slug}/${jobId}] ${reply}`
+async function deliver({ slug, jobId, reply, deliverTo, prefix = true }) {
+  // Job field "prefix": false drops the [profile/job] stamp — for human-facing
+  // digests where the stamp is noise. Default keeps it (unchanged behaviour).
+  const text = prefix ? `[${slug}/${jobId}] ${reply}` : reply
 
-  const m = /^(whatsapp|slack):([a-z0-9_-]+)$/i.exec(deliverTo)
-  if (m) {
-    const [, ch, userSlug] = m
+  // deliver_to is one target or a list: "whatsapp:operator" or ["whatsapp:operator", "slack:teammate"].
+  const targets = (Array.isArray(deliverTo) ? deliverTo : [deliverTo]).map((t) => String(t ?? ''))
+  const TARGET = /^(whatsapp|slack):([a-z0-9_-]+)$/i
+  const chatTargets = targets.filter((t) => TARGET.test(t))
+  let delivered = 0
+  for (const t of chatTargets) {
+    const [, ch, userSlug] = TARGET.exec(t)
     const user = await findUserBySlug(userSlug)
     if (user) {
       const channel = channels[ch.toLowerCase()]
@@ -216,7 +223,9 @@ async function deliver({ slug, jobId, reply, deliverTo }) {
       if (channel && target) {
         try {
           await channel.sendDM(target, text)
-          return
+          delivered++
+          console.log(`[scheduler] delivered ${jobId} to ${t}`)
+          continue
         } catch (err) {
           console.error(`[scheduler] ${ch} delivery to ${userSlug} failed: ${err.message}`)
         }
@@ -227,6 +236,9 @@ async function deliver({ slug, jobId, reply, deliverTo }) {
       console.error(`[scheduler] no user with slug "${userSlug}" in users.json`)
     }
   }
+  // Every chat target reached -> done. No chat targets (explicit "file") or any
+  // failure -> fall through to the file log so the reply is never lost.
+  if (chatTargets.length > 0 && delivered === chatTargets.length) return
 
   // Fallback (or explicit "file"): append to the profile's jobs-output log.
   const outDir = path.join(config.vaultDir, 'users', slug, 'jobs-output')

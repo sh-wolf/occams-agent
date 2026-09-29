@@ -22,7 +22,7 @@ your laptop ──► Slack servers     ──►  │                          
 your laptop ──► markdown editor opens vault folder ◄──────┘   (via Syncthing, git pull, or NFS)
 ```
 
-The bridge is **entirely outbound**. WhatsApp, Slack, Anthropic, and OpenAI are all spoken to from the VM. No inbound ports, DNS, or TLS are required.
+The bridge is **entirely outbound**. WhatsApp, Slack, Anthropic, and OpenAI are all spoken to from the VM. No inbound ports, DNS, or TLS are required. (The optional agent API and inbound webhook bind `127.0.0.1` only; exposing them is the operator's reverse proxy / VPN to arrange.)
 
 ## The two axes: users and profiles
 
@@ -39,7 +39,7 @@ The user record gates access; the profile defines the persona. A user can use ma
 Boots the channels (whichever are enabled in `.env`), waits for them to connect, then starts the scheduler. Each channel returns a small interface (notably `sendDM(target, text)`) the scheduler uses to deliver cron-job replies.
 
 ### `src/channels/whatsapp.js` — Baileys
-Pairs your real WhatsApp account via QR code on first run. Auth lives in `auth/`. Inbound messages flow through `messages.upsert`, get matched against `users.json` by sender phone, and are forwarded to the router. Outbound chunked at 3.5KB to stay under WhatsApp's per-message limit. Re-connects automatically on disconnect. Voice notes are transcribed via Groq Whisper before being forwarded as text.
+Pairs your real WhatsApp account via QR code on first run. Auth lives in `auth/`. Inbound messages flow through `messages.upsert`, get matched against `users.json` by sender phone, and are forwarded to the router. Outbound chunked at 3.5KB to stay under WhatsApp's per-message limit. Re-connects automatically on disconnect. Voice notes are transcribed via Groq Whisper before being forwarded as text. Images and documents (PDFs etc., capped at 20 MB) are downloaded and saved under the profile's `inbox-media/` scratch dir with a pointer line in the message, so the agent opens them with its Read tool. Outbound, an agent can attach a file by writing `[[attach:/abs/path]]` in its reply. WhatsApp's LID privacy mode is handled: the bridge remembers each sender's `@lid` address from their inbound DMs and uses it for scheduler deliveries, since the plain phone-number address may have no usable session on their device.
 
 ### `src/channels/slack.js` — Bolt Socket Mode
 Outbound WebSocket to Slack, no public webhook needed. Listens for `app_mention` and DMs (`channel_type === 'im'`). Replies in thread with a live-edited message showing the agent's tool trace while it works, then replaces it with the final answer. `chatId = slack:<channel>:<thread_ts>` so each thread is an isolated conversation.
@@ -124,7 +124,13 @@ When a job fires:
 Helpers for `/cron` and `/jobs`. Reads/writes the same JSON job files the scheduler watches, so power users can bypass the agent for quick schedules.
 
 ### `src/state.js` — session storage
-Single JSON file at `state.json` (gitignored). Keyed by `chatId`, each entry stores per-profile, per-CLI session IDs and the chat's profile binding. Survives bridge restarts so conversations resume seamlessly.
+Single JSON file at `state.json` (gitignored). Keyed by `chatId`, each entry stores per-profile, per-CLI session IDs and the chat's profile binding, plus the WhatsApp phone → LID map. Survives bridge restarts so conversations resume seamlessly.
+
+### `src/api.js` + `src/registry.js` — agent API (optional)
+Off by default (`ENABLE_AGENT_API=false`). A small token-gated HTTP API on localhost for a personal dashboard or an Obsidian plugin: projects, kanban tasks, chats, runs, scheduled jobs, vault tree/file reads, and stop/message controls. `registry.js` is the control-plane store behind it (`runtime-data/control-plane.json`, gitignored); `transcript.js` reads the CLIs' own session files so the dashboard can show a chat's full history. Dashboard-created chats get stable `chat-*` ids and can be picked up from Slack/WhatsApp with `/resume <chat-id>` or attached to a task with `/task <task-id>`. Endpoint list in the runtime [README](../README.md#agent-api). Treat the token like admin's password — the API can drive any profile.
+
+### `src/webhook.js` — inbound webhook (optional)
+Off by default (`ENABLE_WEBHOOK=false`). Lets an external service trigger one stateless run under a fixed profile per verified POST. Two fail-closed gates (unguessable path secret + HMAC over the raw body), localhost bind, size-capped body, concurrency cap. The security model is spelled out at the top of the file.
 
 ## Message flow (the full path)
 
@@ -235,7 +241,12 @@ A "job" is a JSON file under `vault/users/<profile-slug>/jobs/`:
 }
 ```
 
-If `timezone` is omitted, the scheduler uses the runtime's configured default timezone (`DEFAULT_TIMEZONE`, default `America/New_York`).
+If `timezone` is omitted, the scheduler uses the runtime's configured default timezone (`DEFAULT_TIMEZONE` in `.env`; unset means the server's local zone).
+
+Optional fields:
+- `model` — per-job model override. For `agent_cli: "claude"` it's passed as `--model`; for `codex` as `-c model="<name>"`. Useful for a cheap nightly summary on a small model while interactive sessions on the same profile stay on the profile's default (`model` in `permissions.json`).
+- `deliver_to` may be a list (`["whatsapp:operator", "slack:teammate"]`); every target gets the reply, and any failed chat delivery falls through to the file log so nothing is lost.
+- `prefix: false` drops the `[<profile>/<job>] ` stamp from chat deliveries — for human-facing digests where it's noise.
 
 Two ways to create jobs:
 - **Via the agent** (preferred): "remind me every Monday at 9am". The agent writes the file via its Write tool.
@@ -256,6 +267,8 @@ When a job fires:
 | `users.json` | Identity + access (phone → slug → allowed profiles) | yes |
 | `state.json` | Session IDs and profile bindings per chatId | yes |
 | `auth/` | Baileys WhatsApp session (persisted across restarts) | yes |
+| `permissions.json` | Per-profile authority (areas, sandbox, env, billing, model, deny_tools) | yes (template: `permissions.example.json`) |
+| `runtime-data/` | Agent API control-plane store (projects, tasks, chats, runs) | yes |
 | `vault/` | Knowledge base | tracked (so the schema + structure ship in the repo) |
 
 Example templates: `.env.example`, `users.example.json`. The schema lives at `vault/CLAUDE.md` (versioned).

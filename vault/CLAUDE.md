@@ -111,9 +111,12 @@ Fields:
   - `whatsapp:<user-slug>` — DM that human via WhatsApp (look up the user in `users.json`).
   - `slack:<user-slug>` — DM that human via Slack.
   - `file` — append the reply to `vault/users/<your-slug>/jobs-output/<id>.md`. Use this when the cron's value is the side effects (a vault edit), not the textual reply.
+  - A **list** of the above (e.g. `["whatsapp:operator", "slack:teammate"]`) — delivered to each; if any chat delivery fails the reply is also appended to the file log.
   - Defaults to `file` if omitted. There's no "send to whoever set this up" fallback — cron-fired runs don't know who scheduled them.
+- `prefix` — chat deliveries are stamped `[<profile>/<job>] ` at the front by default. Set `"prefix": false` for human-facing digests where the stamp is noise.
 - `runOnce` — if `true`, the bridge deletes the job after it fires once. Use this for one-shot reminders.
-- `timezone` — IANA name (e.g. `America/Los_Angeles`). Optional; defaults to the bridge's configured default timezone (`America/New_York` unless overridden).
+- `timezone` — IANA name (e.g. `America/Los_Angeles`). Optional; defaults to the bridge's configured default timezone (`DEFAULT_TIMEZONE` in `.env`, else the server's timezone).
+- `model` — optional per-job model override. For `agent_cli: "claude"` it's passed as `--model` (e.g. a cheap Haiku for a nightly summary, a heavier model for a weekly analysis). For `agent_cli: "codex"` it's passed as `-c model="<name>"`. Unset = the profile's default model from `permissions.json` (or the CLI default if neither is set).
 
 **Confirm the schedule in chat** when the human asked you to make one, in plain English: `Scheduled weekly-summary: every Monday at 9am Pacific, I'll DM you a summary of last week's ingests.`
 
@@ -128,6 +131,12 @@ If an area you're about to write into is missing its `index.md`, `log.md`, `raw/
 ## Output discipline
 
 Your stdout is the chat reply. Write files with the file-write tool; don't paste long markdown back into chat. The user sees the result in their wiki editor.
+
+**Sending files over WhatsApp.** To attach a file to your reply, embed `[[attach:/absolute/path]]` anywhere in your stdout. The runtime strips the marker, sends the cleaned text first, then dispatches the file as a follow-up media message (image, audio, video, or generic document inferred by extension). You can include multiple markers. If your reply is *only* markers, the runtime skips the text post entirely. Slack does not support this yet — WhatsApp only.
+
+**Receiving files.** Inbound images and documents (PDFs etc.) from WhatsApp/Slack are saved under `./inbox-media/` in your cwd and the message carries a pointer line per file. Open them with the Read tool (it renders images and reads PDFs). They are pruned after a week.
+
+**Asking questions.** The interactive `AskUserQuestion` tool is disabled — its multiple-choice UI can't reach the human over chat. Ask in plain text and end your turn; the answer arrives as the next message.
 
 ## On uncertainty
 

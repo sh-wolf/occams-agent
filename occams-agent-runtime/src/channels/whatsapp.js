@@ -14,7 +14,7 @@ import { config } from '../config.js'
 import { handleMessage } from '../router.js'
 import { findUserByWhatsapp } from '../users.js'
 import { transcribeAudio } from '../transcribe.js'
-import { getChatStreaming } from '../state.js'
+import { getChatStreaming, getWhatsappLid, setWhatsappLid } from '../state.js'
 import { createStreamDriver } from './stream-driver.js'
 import { toWhatsappText } from './whatsapp-format.js'
 
@@ -22,6 +22,10 @@ const CHUNK = 3500
 // WhatsApp is tighter on edit rate than Slack's chat.update (~1/s). Edit the
 // live trace message at most this often.
 const RENDER_INTERVAL_MS = 1800
+// Cap on inbound documents (PDFs etc.) we pull into the sandbox and hand to the
+// agent. Big enough for real contracts/decks, small enough to not choke the
+// Read tool or the box. Anything larger gets a polite bounce.
+const MAX_DOC_BYTES = 20 * 1024 * 1024
 
 let currentSock = null
 
@@ -31,6 +35,7 @@ function extractText(msg) {
     msg.message?.extendedTextMessage?.text ||
     msg.message?.imageMessage?.caption ||
     msg.message?.videoMessage?.caption ||
+    msg.message?.documentMessage?.caption ||
     ''
   )
 }
@@ -197,6 +202,19 @@ async function connect() {
 
       const jid = m.key.remoteJid
 
+      // Remember the phone -> LID pairing from LID-mode DMs so sendDM (scheduler
+      // deliveries) can target the address the phone actually has a session for.
+      if (jid.endsWith('@lid') && m.key.senderPn) {
+        setWhatsappLid(phone, jid).catch((err) => console.error('[whatsapp] lid map save failed:', err.message))
+      }
+
+      // A captioned document arrives as documentWithCaptionMessage, which nests
+      // the real documentMessage. Unwrap it so both caption extraction and the
+      // document download branch below see a plain documentMessage.
+      if (m.message?.documentWithCaptionMessage?.message) {
+        m.message = m.message.documentWithCaptionMessage.message
+      }
+
       // If this is a voice note (audioMessage), download + transcribe and
       // fold the transcript into the message text. Captions (when the user
       // includes text along with the audio — rare on WhatsApp) are preserved.
@@ -243,7 +261,46 @@ async function connect() {
           continue
         }
       }
-      if (!text && attachments.length > 0) text = '(image)'
+      // Document messages (PDFs, docs, spreadsheets, etc.): download and pass
+      // through as an attachment. The agent writes it into its scratch and opens
+      // it with the Read tool (which reads PDFs natively). Size-capped so a huge
+      // file can't be pulled into the sandbox.
+      if (m.message?.documentMessage) {
+        const doc = m.message.documentMessage
+        const declared = Number((doc.fileLength ?? 0).toString()) || 0
+        if (declared > MAX_DOC_BYTES) {
+          await sock.sendMessage(jid, {
+            text: `⚠️ That file is ${(declared / 1e6).toFixed(1)} MB — over my ${MAX_DOC_BYTES / 1e6} MB limit for reading here. Send a smaller version or just the key pages?`,
+          }).catch(() => {})
+          continue
+        }
+        try {
+          const buf = await downloadMediaMessage(m, 'buffer', {}, {
+            reuploadRequest: sock.updateMediaMessage,
+          })
+          if (buf.length > MAX_DOC_BYTES) {
+            await sock.sendMessage(jid, {
+              text: `⚠️ That file is over my ${MAX_DOC_BYTES / 1e6} MB limit for reading here.`,
+            }).catch(() => {})
+            continue
+          }
+          const mimeType = doc.mimetype || 'application/octet-stream'
+          const name = doc.fileName || `document-${m.key.id}`
+          console.log(`[whatsapp] received document ${name} (${mimeType}, ${buf.length} bytes)`)
+          attachments.push({ buffer: buf, mimetype: mimeType, name })
+        } catch (err) {
+          console.error('[whatsapp] document download failed:', err.message)
+          await sock.sendMessage(jid, {
+            text: `⚠️ Couldn't fetch that document: ${err.message}`,
+          }).catch(() => {})
+          continue
+        }
+      }
+      if (!text && attachments.length > 0) {
+        text = attachments.some((a) => (a.mimetype || '').startsWith('image/'))
+          ? '(image)'
+          : '(document)'
+      }
       if (!text) continue
 
       const chatId = `whatsapp:${jid}`
@@ -294,7 +351,9 @@ async function connect() {
 
 async function sendDM(phone, text) {
   if (!currentSock) throw new Error('whatsapp not connected')
-  const jid = `${phone}@s.whatsapp.net`
+  // Prefer the LID address learned from the user's own inbound DMs; the
+  // phone-number address may have no usable Signal session on their device.
+  const jid = (await getWhatsappLid(phone)) ?? `${phone}@s.whatsapp.net`
   const { cleaned, paths: outPaths } = extractAttachments(text)
   if (cleaned) await sendChunked(currentSock, jid, toWhatsappText(cleaned))
   for (const p of outPaths) {

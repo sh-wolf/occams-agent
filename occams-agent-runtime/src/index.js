@@ -29,6 +29,7 @@ async function main() {
   console.log(`  whatsapp:  ${config.whatsapp.enabled ? 'on' : 'off'}`)
   console.log(`  slack:     ${config.slack.enabled ? 'on' : 'off'}`)
   console.log(`  webhook:   ${config.webhook.enabled ? `127.0.0.1:${config.webhook.port} → /${config.webhook.profile}` : 'off'}`)
+  console.log(`  agent api: ${config.agentApi.enabled ? `${config.agentApi.host}:${config.agentApi.port}` : 'off'}`)
 
   if (!(await exists(config.usersFile))) {
     console.error(`\n⚠️  ${config.usersFile} not found. Copy users.example.json to users.json and edit before any messages will be accepted.\n`)
@@ -46,13 +47,18 @@ async function main() {
     channels[name] = channel
   }
 
-  if (!channels.whatsapp && !channels.slack && !config.webhook.enabled) {
-    console.error('No channels started. Set ENABLE_WHATSAPP=true, ENABLE_SLACK=true (with valid tokens), or ENABLE_WEBHOOK=true.')
+  if (!channels.whatsapp && !channels.slack && !config.webhook.enabled && !config.agentApi.enabled) {
+    console.error('No channels started. Set ENABLE_WHATSAPP=true, ENABLE_SLACK=true (with valid tokens), ENABLE_WEBHOOK=true, or ENABLE_AGENT_API=true.')
     process.exit(1)
   }
 
   const { startScheduler } = await import('./scheduler.js')
   await startScheduler({ channels })
+
+  if (config.agentApi.enabled) {
+    const { startAgentApi } = await import('./api.js')
+    await startAgentApi()
+  }
 
   if (config.webhook.enabled) {
     const { startWebhook } = await import('./webhook.js')

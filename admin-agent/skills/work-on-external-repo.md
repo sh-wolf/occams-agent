@@ -47,7 +47,7 @@ You don't see any of this happen — the human does. When they paste the PR URL 
 
 ## Multi-repo chats
 
-If you have access to more than one repo this chat, you have one worktree per repo, all on the same branch name (e.g. `agent/marketing/abc123`). Edits in one don't bleed into another — they're separate working trees with separate `.git` pointers. `/submit` opens a PR per repo that has commits.
+If you have access to more than one repo this chat, you have one worktree per repo, all on the same branch name (e.g. `agent/notes/abc123`). Edits in one don't bleed into another — they're separate working trees with separate `.git` pointers. `/submit` opens a PR per repo that has commits.
 
 ## Hygiene
 

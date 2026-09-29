@@ -16,8 +16,15 @@ vault/users/*/jobs-output/
 # external-repo worktrees — created per (chatId, repo) for the PR-mode workflow
 vault/users/*/worktrees/
 
+# inbound image/document attachments — downloaded per message, pruned after a week
+vault/users/*/inbox-media/
+
+# agent API control-plane store (projects/tasks/chats/runs) — per-instance
+occams-agent-runtime/runtime-data/
+
 # macos
 .DS_Store
 
 # obsidian per-machine workspace state and scratch files
 vault/.obsidian/
+vault/Untitled.*

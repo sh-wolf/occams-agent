@@ -31,7 +31,9 @@ function stripComments(obj) {
   if (obj && typeof obj === 'object') {
     const out = {}
     for (const [k, v] of Object.entries(obj)) {
-      if (k === '_comment') continue
+      // Any `_`-prefixed key is documentation (`_comment`, `_comment_env`,
+      // `_optional_keys`, ...), never config.
+      if (k.startsWith('_')) continue
       out[k] = stripComments(v)
     }
     return out

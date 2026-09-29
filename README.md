@@ -33,7 +33,7 @@ your laptop ──► Slack servers     ──►  │  Bolt ────┴► 
                                        └──────────────────────────────────┘
 ```
 
-No inbound ports. No public webhook. No queue. No database. Just files, a Node process, and a CLI subprocess per turn.
+No inbound ports. No public webhook. No queue. No database. Just files, a Node process, and a CLI subprocess per turn. (Two opt-in localhost listeners exist for when you want them: a token-gated agent API for a dashboard or Obsidian plugin, and an HMAC-gated inbound webhook. Both are off by default.)
 
 ## What's in the box
 
@@ -56,10 +56,15 @@ occams-agent/
     areas/                   topical mini-wikis (created on demand)
     users/                   per-profile scratch + cron job files
 
+  deploy/
+    cron-backup.sh           nightly git snapshot of the repo (pull/rebase, then push)
+    set-env-var.sh           add a secret to .env without it touching ps or shell history
+
   occams-agent-runtime/     the runtime (Node)
-    src/                     ~1500 lines: channels, router, agent spawn, scheduler
+    src/                     channels, router, agent spawn, scheduler, sandbox,
+                             optional agent API (dashboard) + inbound webhook
     deploy/                  systemd unit + install.sh
-    docs/                    HOW_IT_WORKS.md + GETTING_STARTED.md
+    docs/                    HOW_IT_WORKS.md, GETTING_STARTED.md, UPDATING.md, HOWTO.md
     package.json
 ```
 

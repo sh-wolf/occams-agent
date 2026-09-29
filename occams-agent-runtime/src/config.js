@@ -45,6 +45,9 @@ export const config = {
   permissionsFile: path.resolve(repoRoot, process.env.PERMISSIONS_FILE ?? './permissions.json'),
   defaultAgent: defaultAgent(),
   defaultProfile: (process.env.DEFAULT_PROFILE ?? '').trim().toLowerCase() || null,
+  // IANA zone applied to cron jobs that omit `timezone`. Unset => node-cron
+  // uses the server's local zone.
+  defaultTimezone: (process.env.DEFAULT_TIMEZONE ?? '').trim() || null,
   sharedBindPaths: sharedBindPaths(),
   claude: {
     permissionMode: process.env.CLAUDE_PERMISSION_MODE ?? 'bypassPermissions',

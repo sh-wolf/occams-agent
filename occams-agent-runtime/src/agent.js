@@ -163,10 +163,11 @@ function extFor({ mimetype, name }) {
   return sub === 'jpeg' ? 'jpg' : sub.replace(/[^a-z0-9]/gi, '') || 'bin'
 }
 
-// Write inbound image attachments into the profile's scratch dir (always in
-// --add-dir and sandbox-writable) and append a pointer so the agent reads them
-// with its Read tool, which renders images natively. Opportunistically prunes
-// files older than a week — no cron needed; every inbound image sweeps the dir.
+// Write inbound media attachments (images, documents) into the profile's scratch
+// dir (always in --add-dir and sandbox-writable) and append a pointer so the
+// agent reads them with its Read tool, which renders images and reads PDFs
+// natively. Opportunistically prunes files older than a week — no cron needed;
+// every inbound attachment sweeps the dir.
 async function materializeAttachments(cwd, message, attachments) {
   if (!attachments || attachments.length === 0) return message
   const mediaDir = path.join(cwd, MEDIA_DIRNAME)
@@ -187,7 +188,9 @@ async function materializeAttachments(cwd, message, attachments) {
     const fname = `${now}-${randomUUID().slice(0, 8)}.${extFor(att)}`
     const abs = path.join(mediaDir, fname)
     await writeFile(abs, att.buffer)
-    pointers.push(`[image]: saved to ${abs} — view it with the Read tool`)
+    const isImage = (att.mimetype || '').startsWith('image/')
+    const label = isImage ? 'image' : `file${att.name ? ` ${att.name}` : ''}`
+    pointers.push(`[${label}]: saved to ${abs} — ${isImage ? 'view' : 'open'} it with the Read tool`)
   }
   if (pointers.length === 0) return message
   const joined = pointers.join('\n')
@@ -327,6 +330,12 @@ const BWRAP_PATH = findBwrap()
 // SHARED_BIND_PATHS env var (comma-separated absolute paths) rather than
 // being hardcoded here. We bind whatever exists; missing entries are
 // silently skipped.
+//
+// NOTE: binding a path only makes a binary visible — it does NOT grant any
+// agent access to it; credentials are scoped per profile in permissions.json.
+// HTTP MCP servers (a `"type": "http"` entry in .mcp.json pointing at
+// 127.0.0.1) need no entry here: nothing is spawned and the sandbox shares
+// the host network.
 function sharedReadOnlyPaths() {
   const candidates = [
     path.join(config.repoRoot, 'vault', 'CLAUDE.md'),
@@ -567,12 +576,16 @@ async function runClaude({ profile, user, chatId, message, attachments, timeoutM
   const effectiveModel = model || profile.model
   if (effectiveModel) args.push('--model', effectiveModel)
   if (profile.effort) args.push('--effort', profile.effort)
-  // Per-profile tool denylist (e.g. keep an MCP server's read tools while
-  // blocking its write tools). Variadic flag, so it must come before --add-dir
-  // below — the CLI stops consuming at the next flag.
-  if (profile.deny_tools?.length) {
-    args.push('--disallowed-tools', ...profile.deny_tools)
-  }
+  // Tool denylist, merged into one variadic --disallowed-tools flag (which must
+  // come before --add-dir below — the CLI stops consuming at the next flag):
+  //   1. AskUserQuestion — denied for EVERY profile. It renders an interactive
+  //      multiple-choice UI that our WhatsApp/Slack bridge can't deliver, so the
+  //      question silently never reaches the human. Agents must ask in plain
+  //      text instead. (Applies to all profiles incl. admin, and any new ones.)
+  //   2. Per-profile deny_tools from permissions.json (e.g. keep an MCP
+  //      server's read tools while blocking its write tools).
+  const disallowedTools = ['AskUserQuestion', ...(profile.deny_tools ?? [])]
+  args.push('--disallowed-tools', ...disallowedTools)
   const addDirs = [...profileDirs, ...areaDirs, ...repoBindDirs, cwd]
   if (addDirs.length > 0) {
     args.push('--add-dir', ...addDirs)

@@ -22,6 +22,26 @@ async function save() {
   return writing
 }
 
+// ----- WhatsApp phone -> LID address map -----
+// WhatsApp's LID privacy mode means a phone's live Signal session with the
+// bot is keyed by "<lid>@lid", not "<phone>@s.whatsapp.net". Sending to the
+// phone-number address still "succeeds" but the recipient's phone can't
+// decrypt it ("Waiting for this message"). Every inbound DM carries both
+// addresses (remoteJid = lid, senderPn = phone), so we remember the pair and
+// let sendDM prefer the LID.
+export async function getWhatsappLid(phone) {
+  const state = await load()
+  return state.whatsappLids?.[phone] ?? null
+}
+
+export async function setWhatsappLid(phone, lidJid) {
+  const state = await load()
+  state.whatsappLids ??= {}
+  if (state.whatsappLids[phone] === lidJid) return
+  state.whatsappLids[phone] = lidJid
+  await save()
+}
+
 function chatEntry(state, chatId) {
   state.chats[chatId] ??= { profile: null, sessions: {} }
   state.chats[chatId].sessions ??= {}

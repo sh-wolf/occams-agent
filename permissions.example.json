@@ -12,6 +12,14 @@
       "env": {}
     },
 
+    "_optional_keys": {
+      "_comment": "Not a profile — documents the optional per-profile keys. `model`: pin a CLI model (e.g. \"claude-sonnet-4-6\"); a cron job's own `model` field overrides it. `effort`: passed to `claude --effort`. `streaming`: false makes this profile default to no live tool trace (users can still `/streaming on`). `deny_tools`: names passed to `claude --disallowed-tools`, e.g. keep an MCP server's read tools but block its write tools (AskUserQuestion is always denied — it can't render over chat). Claude CLI only.",
+      "model": "claude-sonnet-4-6",
+      "effort": "high",
+      "streaming": false,
+      "deny_tools": ["mcp__some_server__delete_thing"]
+    },
+
     "notes": {
       "areas": ["*"],
       "superuser": false,
